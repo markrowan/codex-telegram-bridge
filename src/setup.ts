@@ -41,6 +41,10 @@ export async function setup(): Promise<void> {
   console.log('Saved private local configuration. Install the user service, start it for acceptance, message the bot, then approve its pairing code locally.');
 }
 function systemdValue(value: string): string { return '"' + value.replace(/%/g, '%%').replace(/\\/g, '\\\\').replace(/"/g, '\\"').replace(/\n/g, '') + '"'; }
+export function userUnit(root: string, node: string, state: string): string {
+  if (![root, node, state].every(value => value.startsWith('/') && !/[\r\n]/.test(value))) throw new Error('Service paths must be absolute and contain no line breaks');
+  return `[Unit]\nDescription=Telegram control for the existing Codex daemon\nAfter=network-online.target\n\n[Service]\nType=simple\nEnvironment=${systemdValue('CODEX_TELEGRAM_STATE_DIR=' + state)}\nExecStart=/usr/bin/flock --nonblock ${systemdValue(join(state, 'bridge.lock'))} ${systemdValue(node)} ${systemdValue(join(root, 'dist', 'bridge.js'))}\nWorkingDirectory=${root.replace(/%/g, '%%')}\nRestart=on-failure\nRestartSec=5\nUMask=0077\nNoNewPrivileges=true\nTimeoutStopSec=15\n\n[Install]\nWantedBy=default.target\n`;
+}
 export function service(command: string): void {
   if (process.platform !== 'linux') throw new Error('User-service installation currently supports Linux only');
   const directory = join(homedir(), '.config', 'systemd', 'user');
@@ -50,7 +54,7 @@ export function service(command: string): void {
     mkdirSync(directory, { recursive: true, mode: 0o700 });
     mkdirSync(paths().stateDir, { recursive: true, mode: 0o700 });
     const root = dirname(dirname(fileURLToPath(import.meta.url)));
-    const body = `[Unit]\nDescription=Telegram control for the existing Codex daemon\nAfter=network-online.target\n\n[Service]\nType=simple\nEnvironment=${systemdValue('CODEX_TELEGRAM_STATE_DIR=' + paths().stateDir)}\nExecStart=/usr/bin/flock --nonblock ${systemdValue(join(paths().stateDir, 'bridge.lock'))} ${systemdValue(process.execPath)} ${systemdValue(join(root, 'dist', 'bridge.js'))}\nWorkingDirectory=${systemdValue(root)}\nRestart=on-failure\nRestartSec=5\nUMask=0077\nNoNewPrivileges=true\nTimeoutStopSec=15\n\n[Install]\nWantedBy=default.target\n`;
+    const body = userUnit(root, process.execPath, paths().stateDir);
     if (existsSync(file) && readFileSync(file, 'utf8') !== body) throw new Error('An existing service differs; inspect it before replacing it');
     writeFileSync(file, body, { mode: 0o600 }); systemctl(['daemon-reload']);
     console.log('Installed inactive service. Use service start for acceptance; enable only after acceptance passes.');
