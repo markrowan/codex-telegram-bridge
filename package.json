@@ -1,26 +1,26 @@
 {
   "name": "codex-telegram-bridge",
-  "version": "0.1.3",
-  "description": "Local Telegram bridge for continuing OpenAI Codex app-server threads from your phone.",
+  "version": "0.2.0",
+  "description": "Private Telegram control for existing shared Codex daemon threads.",
   "license": "MIT",
   "type": "module",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/codenoah/codex-telegram-bridge.git"
+    "url": "git+https://github.com/markrowan/codex-telegram-bridge.git"
   },
   "bugs": {
-    "url": "https://github.com/codenoah/codex-telegram-bridge/issues"
+    "url": "https://github.com/markrowan/codex-telegram-bridge/issues"
   },
-  "homepage": "https://github.com/codenoah/codex-telegram-bridge#readme",
+  "homepage": "https://github.com/markrowan/codex-telegram-bridge#readme",
   "bin": {
-    "codex-remote": "bin/codex-remote",
     "codex-tg": "bin/codex-tg"
   },
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "start": "node dist/bridge.js",
     "access": "node dist/access.js",
-    "check": "npm run build",
+    "check": "tsc -p tsconfig.json --noEmit",
+    "test": "npm run build && node --test --test-isolation=none tests/*.test.mjs",
     "prepack": "npm run build"
   },
   "keywords": [
@@ -32,11 +32,10 @@
     "developer-tools"
   ],
   "engines": {
-    "node": ">=20"
+    "node": ">=24"
   },
   "files": [
     "bin/",
-    "skills/",
     "dist/",
     "src/",
     "README.md",

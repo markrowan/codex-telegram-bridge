@@ -1,210 +1,89 @@
-# Codex Telegram Bridge
+# Codex Telegram Bridge — shared daemon fork
 
-[한국어](./README.ko.md) | English
+A private Telegram interface to existing Codex conversations on your machine, including conversations controlled from ChatGPT. This fork extends [codenoah/codex-telegram-bridge](https://github.com/codenoah/codex-telegram-bridge), preserving its MIT license and attribution.
 
-Continue the same OpenAI Codex app-server thread from your terminal and from
-Telegram.
-
-This bridge is intentionally small. It starts a local `codex app-server`, opens
-your normal `codex --remote` terminal UI, and runs a Telegram bot that sends
-messages into the active Codex thread. Your local Codex installation remains the
-source of truth.
-
-## Features
-
-- Shared Codex app-server thread between terminal and Telegram.
-- Telegram pairing and allowlist access control.
-- Inline `Stop current turn` button for active Codex turns.
-- Command/file-change approval prompts with inline buttons.
-- Telegram `typing` status while Codex is writing a response.
-- Completed turns leave only the final answer in Telegram.
-- Explicit `/diff` and `/file` commands for follow-up inspection.
-- Project cwd control without exposing Codex directly to the internet.
+The bot connects to the existing Codex app-server's Unix control socket. It never launches, restarts, or reconfigures Codex. Attaching and sending messages inherit the conversation's model, working directory, sandbox and approval policy.
 
 ## Requirements
 
-- OpenAI Codex CLI with `app-server` support.
-- Node.js 20 or newer.
-- Telegram bot token from BotFather.
-- `tmux` and `curl` are recommended. The bridge can run without `tmux`, but
-  tmux gives you durable app-server and bridge panes.
+- Linux with a running Codex daemon and accessible control socket.
+- Node 24 LTS and npm.
+- A dedicated bot created with Telegram's **@BotFather**.
+- One locally paired Telegram account, using a private bot chat.
 
-## Install
-
-```sh
-npm install -g codex-telegram-bridge
-```
-
-The first `codex-tg` or `codex-remote` run installs a small optional Codex skill
-under `~/.codex/skills/codex-telegram-notify` when it is missing. The skill
-teaches future Codex sessions to use `codex-tg notify` instead of reading
-Telegram bot tokens or calling the Telegram Bot API directly.
-
-### Using nvm
-
-`codex-telegram-bridge` works with `nvm`, but npm global packages are installed
-per Node.js version. Install it under the Node version you normally use for
-Codex:
+## Build and local setup
 
 ```sh
-nvm use 22
-npm install -g codex-telegram-bridge
-```
-
-If `codex-tg` or `codex-remote` disappears after `nvm use <version>`, install
-the package again for that Node version. The active `node` on your `PATH` must be
-Node.js 20 or newer.
-
-## Install From Source
-
-```sh
-git clone https://github.com/codenoah/codex-telegram-bridge.git
-cd codex-telegram-bridge
-npm install
+npm ci --ignore-scripts
+npm run check
+npm test
 npm run build
-npm link
+# Make bin/codex-tg available on PATH, with Node on PATH.
+codex-tg setup
+codex-tg service install
+codex-tg service start
 ```
 
-If you do not use `npm link`, run the scripts directly from this directory.
+`setup` prompts for the token with hidden input and asks for a project directory. Configuration and runtime state are private local files under `~/.codex/telegram-bridge`, or `CODEX_TELEGRAM_STATE_DIR`. Do not paste tokens into prompts, commit them, or pass them in process arguments.
 
-## Quick Start
-
-Save your Telegram bot token:
+Message the bot. It will give you a pairing code. In your local terminal, inspect and approve it:
 
 ```sh
-codex-tg token
-```
-
-You can also install or refresh the optional Codex skill explicitly:
-
-```sh
-codex-tg install-skill
-```
-
-Start Codex from the project directory you want Codex to work in:
-
-```sh
-cd /path/to/project
-codex-remote
-```
-
-The wrapper starts `codex app-server` on `ws://127.0.0.1:17345`, starts the
-Telegram bridge when a token is configured, then opens:
-
-```sh
-codex --remote ws://127.0.0.1:17345 --no-alt-screen
-```
-
-## Pair Telegram
-
-DM your bot. It will reply with a pairing code. Approve it locally:
-
-```sh
+codex-tg status
 codex-tg pair <code>
 ```
 
-After pairing, lock the bot down so unknown users cannot request pairing codes:
+Pairing locks the bot to that account. Additional accounts are refused. Keep the service in manual-start mode while completing acceptance tests; enable startup only after those tests pass:
 
 ```sh
-codex-tg policy allowlist
+codex-tg service enable
 ```
 
-## Telegram Commands
+## Conversation controls
 
-- `/status` shows the active thread and bridge state.
-- `/new` creates a fresh Codex thread.
-- `/cancel` stops the current Codex turn without ending the thread.
-- `/cwd` shows the current project directory.
-- `/cwd <path>` changes the project directory for the next Codex thread.
-- `/diff` shows the last turn diff, or the current git diff as a fallback.
-- `/diff <path>` shows a file-specific diff.
-- `/file <path>` sends a capped text preview of a file.
-- `/file <path> --all` raises the cap for an explicit full-file request.
-- `/thread <id>` switches Telegram to an existing thread id.
-- Any other text is sent to the active Codex thread.
+| Command | Behavior |
+| --- | --- |
+| `/threads` | Pick a loaded or recent conversation, with pagination. Selection also watches it. |
+| `/watch` / `/unwatch` | Enable or stop notifications for the selected conversation. |
+| `/new` | Pick a configured project and create a conversation. Repository instructions still apply. |
+| `/stop` | Interrupt the selected active turn. |
+| `/status` | Show selection, watched threads, connection and uncertain delivery counts. |
+| `/help` | Show the controls. |
 
-When a Telegram message starts a Codex turn, the working status message includes
-an inline `Stop current turn` button. If you send another message while Codex is
-already working, the bridge asks whether to add it to the current turn, stop the
-current turn, or discard it.
+Ordinary text starts a turn when idle or steers an active turn immediately. A race is reported without silently starting or queueing another turn. Observed activity never changes your selected message target.
 
-To send a local notification through the running bridge, use:
+Watched conversations relay completed user-facing progress, plans, final replies and failures, even when work starts in ChatGPT. Messages include the thread label; raw tool output is excluded. Newly watched threads do not dump old history. Reconnection uses the stored history cursor to recover missed replies.
+
+## Approvals and questions
+
+Command and file requests offer one-action decisions. Explicit permission grants apply to the displayed requested permissions for the current turn only. There is no session-grant or policy-amendment control. Read the displayed request before approving it.
+
+Structured questions offer option buttons and free-text answers bound to the current question card. Reply to that card to enter text. Resolved, completed, expired and disconnected requests cannot be answered again. Requests outside watched threads, secret questions, unknown request types, and requests whose complete details cannot be displayed remain in ChatGPT.
+
+## Configuration and operations
+
+`CODEX_APP_SERVER_URL` accepts only a local `ws+unix://` URL. The default resolves `$CODEX_HOME/app-server-control/app-server-control.sock`, falling back to `~/.codex`. This runtime has no TCP listener.
+
+`CODEX_TELEGRAM_PROJECTS` is a JSON array of `{ "name": "Project", "cwd": "/absolute/project/path" }`. Setup initially suggests `~/Nullsignal` if present. It is a project selection list, not an execution sandbox; Codex's own permissions and repository instructions govern execution.
 
 ```sh
-codex-tg notify "Codex finished the local task."
+codex-tg doctor
+codex-tg service status
+journalctl --user -u codex-telegram-bridge.service
+codex-tg service stop
+codex-tg service uninstall
 ```
 
-This queues a local notification for the bridge process. It does not read the
-Telegram bot token or call the Telegram Bot API from the caller process.
+The service uses `flock` to prevent two managed instances sharing the journal. Uninstall preserves local configuration, state and releases. No skill is installed automatically. This fork removes the upstream launcher that started a separate Codex server.
 
-For Codex agents to choose this command automatically, make sure the optional
-skill is installed:
+## Delivery semantics
 
-```sh
-codex-tg install-skill
-```
+Incoming updates are journaled before Telegram's polling offset advances. Codex mutations are marked before sending; uncertain dispatches are never automatically repeated. A response is confirmed by Codex's resolved-request event. Sent messages are deduplicated by item identity/content, including during history recovery.
 
-Then restart your Codex session so the new skill is discovered.
+If a connection is lost after Telegram or Codex may have accepted an operation, `/status` reports uncertainty. Check the conversation before deciding what to resend. Exactly-once delivery across external services is not claimed. Do not delete or reset the runtime journal to clear uncertainty: doing so discards the evidence used to avoid replay.
 
-## Configuration
+## Validation before normal operation
 
-The bridge reads real environment variables first, then
-`~/.codex/telegram-bridge/.env`.
+Complete a real paired Telegram round trip, multi-thread selection, watched ChatGPT replies, `/new`, steering, stop, questions, approvals answered in both clients, long replies, unauthorized access rejection and restart recovery. Automated tests use mocks and isolated local WebSocket fixtures; they do not require Telegram credentials.
 
-```sh
-CODEX_APP_SERVER_URL=ws://127.0.0.1:17345
-CODEX_APP_SERVER_HEALTH_URL=http://127.0.0.1:17345
-CODEX_TELEGRAM_STATE_DIR=~/.codex/telegram-bridge
-CODEX_BRIDGE_CWD=/absolute/path/to/project
-CODEX_MODEL=
-CODEX_REASONING_EFFORT=
-CODEX_TELEGRAM_PROGRESS=0
-CODEX_TELEGRAM_STREAM_EDITS=0
-CODEX_TELEGRAM_DIFF_MAX_CHARS=30000
-CODEX_TELEGRAM_FILE_PREVIEW_MAX_CHARS=12000
-CODEX_TELEGRAM_FILE_ALL_MAX_CHARS=60000
-```
-
-You can also change the saved cwd locally:
-
-```sh
-codex-tg cwd /absolute/path/to/project
-```
-
-## Security Notes
-
-- Keep the app-server listener on `127.0.0.1`.
-- Do not expose the app-server WebSocket directly to the internet.
-- Do not commit Telegram bot tokens or `~/.codex/telegram-bridge/.env`.
-- Use `codex-tg policy allowlist` after pairing.
-- `/file` is limited to the configured cwd and refuses paths outside it.
-
-Codex can run commands and edit files. Treat Telegram access to this bridge as
-remote access to your local development machine.
-
-## Development
-
-```sh
-npm run check
-```
-
-Useful local commands:
-
-```sh
-npm run build
-npm run start
-npm run access -- status
-```
-
-## License
-
-MIT
-
-## Acknowledgements
-
-This project was inspired by the Telegram workflow in Claude Code's Telegram
-plugin. Its pairing/allowlist access-control flow was informed by that plugin's
-approach. See [THIRD_PARTY_NOTICES.md](./THIRD_PARTY_NOTICES.md) for details.
-
-Codex Telegram Bridge is an independent implementation for OpenAI Codex
-app-server sessions and is not affiliated with Anthropic or OpenAI.
+Attachments, voice, remote configuration changes and model changes are outside this fork's first version.
