@@ -1,6 +1,6 @@
 # Validation
 
-The local CI-equivalent type check, TypeScript build and all 26 automated tests pass on maintained Node 24 LTS. The socket fixture runs outside restricted sandboxes that forbid local listeners.
+The local CI-equivalent type check, TypeScript build and automated tests pass on maintained Node 24 LTS. The socket fixture runs outside restricted sandboxes that forbid local listeners.
 
 An opt-in disposable-daemon proof passed seven behaviors: reply relay, inherited settings, immediate steering with harmless command approval, interruption, approval resolved by a second client, replies initiated by a second client, and structured questions. The proof grants only an exact harmless printf command. It creates its own disposable conversation and stores receipts outside the repository.
 

@@ -96,7 +96,10 @@ export class Controller {
   }
 
   async process(update: any): Promise<void> {
-    if (!this.allowed()) return;
+    if (!this.allowed()) {
+      if (this.store.data.updates[String(update.update_id)]?.state === 'received') this.store.update(update.update_id, { state: 'done' });
+      return;
+    }
     const owner = this.owner();
     const message = update.message;
     const callback = update.callback_query;

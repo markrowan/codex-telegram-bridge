@@ -9,7 +9,7 @@ Base: upstream `47a1c80d2a56675a75eea61772eefa3d3e6a6da9`. Target public fork: `
 - [x] Add structured questions and per-action command/file/permission controls, scoped to owner/chat/connection/thread/turn/request and invalidated on resolution, completion or disconnect. Unsupported/persistent authority stays in ChatGPT.
 - [x] Extend local state with durable incoming dispatch and outgoing delivery journals. Never automatically repeat uncertain Codex mutations or uncertain Telegram sends.
 - [x] Add local token setup, single-owner pairing, direct-daemon systemd user service, reconnect backoff, diagnostics and state-preserving uninstall commands.
-- [x] Pass tests/build/CI-equivalent checks (26 tests) and disposable-thread protocol checks (seven behaviors).
+- [x] Pass tests/build/CI-equivalent checks and disposable-thread protocol checks (seven behaviors).
 - [ ] Install the exact frozen release inactive; complete real Telegram acceptance after local token entry before normal service activation. Record deployment evidence outside the frozen candidate.
 - [ ] Interactive GitHub sign-in at publication time; create fork, push tested branch and open PR with generic documentation only.
 

@@ -209,3 +209,10 @@ test('confirmed old update ids cannot be replayed after journal compaction', asy
   await f.controller.process(f.message(1, 'Old prompt'));
   assert.equal(f.calls.length, 0); assert.equal(f.store.data.updates['1'], undefined);
 });
+test('a journaled message rejected during revocation is not deferred until reauthorization', async () => {
+  const f = fixture(); let enabled = false;
+  const controller = new Controller(f.store, f.codex, f.telegram, [], () => enabled);
+  const update = f.message(1, 'Do not defer this'); f.store.receive([update]);
+  await controller.process(update); enabled = true; await controller.process(update);
+  assert.equal(f.calls.length, 0); assert.equal(f.store.data.updates['1'].state, 'done');
+});
