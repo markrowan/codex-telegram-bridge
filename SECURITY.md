@@ -20,8 +20,10 @@ publishing details. Include:
 
 ## Hardening Checklist
 
-- Keep `CODEX_APP_SERVER_URL` bound to `127.0.0.1`.
+- Use the existing private Unix control socket; this fork refuses TCP endpoints.
 - Use `codex-tg policy allowlist` after pairing your Telegram account.
 - Keep `~/.codex/telegram-bridge/.env` private.
+- Keep the runtime journal private and intact; uncertain operations must not be replayed blindly.
+- Pair one private account locally. Revocation or disabled policy blocks dispatch and outbound delivery.
 - Use a dedicated Telegram bot token for this bridge.
 - Review `/file` and `/diff` output before forwarding it elsewhere.
