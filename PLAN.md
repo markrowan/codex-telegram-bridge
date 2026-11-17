@@ -42,3 +42,11 @@ Scope: bridge code/tests and updating the bridge release used for acceptance. Re
 - [x] Test formatting, nesting, Unicode, incomplete Markdown, long code blocks, replay/dedup and retry persistence; pass build/type checks. Publication, exact-head CI and acceptance-release deployment receipts are retained on the PR and outside Git. Preserve pairing and keep startup disabled.
 
 No new service or configuration is needed. Existing dispatch/approval and Codex daemon settings remain unchanged. Telegram visual acceptance remains an explicit check after deployment.
+
+## Final recovery review corrections
+
+- [x] Recover failed/interrupted turn notices using the same deduplicated path as live events; suppress historical notices when first watching a thread.
+- [x] Retry incomplete history scans with bounded backoff while the daemon connection remains healthy. Retain checkpoints, delivery deduplication, and no automatic replay of uncertain Codex mutations.
+- [x] Test recovery failures/retries, live/history deduplication, concurrent scan requests and backoff; pass local checks. Retain exact-head CI, completed review, conditional fork-main merge and acceptance-release deployment evidence on the PR and private handoff.
+
+Use the existing controller/connect loop; no added service or daemon lifecycle control. Full paired acceptance remains a separate outstanding gate.

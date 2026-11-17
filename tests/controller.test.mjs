@@ -434,3 +434,88 @@ test('approval commands remain literal even when they contain Markdown punctuati
   assert.match(f.sent[0].text, /echo \*\*literal\*\* _file_ `value`/);
   assert.equal(f.sent[0].extra.entities, undefined);
 });
+
+
+test('history recovers failed and interrupted notices once alongside live events', async () => {
+  for (const status of ['failed', 'interrupted']) {
+    for (const liveFirst of [false, true]) {
+      const f = fixture();
+      const turn = { id: 'offline-turn', status, items: [], ...(status === 'failed' ? { error: { message: 'Recovered failure' } } : {}) };
+      f.codex.request = async () => ({ data: [turn], backwardsCursor: 'checkpoint' });
+      const event = { method: 'turn/completed', params: { threadId: 'alpha', turn } };
+      if (liveFirst) await f.controller.notification(event);
+      await f.controller.reconcile('alpha');
+      assert.equal(f.sent.length, 1);
+      await f.controller.notification(event);
+      assert.equal(f.sent.length, 1); assert.match(f.sent[0].text, new RegExp(`Turn ${status}`));
+      if (status === 'failed') assert.match(f.sent[0].text, /Recovered failure/);
+    }
+  }
+});
+
+test('first watching a historical failed turn does not dump its old outcome', async () => {
+  const f = fixture(); const original = f.codex.request.bind(f.codex);
+  f.codex.request = async (method, params) => method === 'thread/turns/list'
+    ? { data: [{ id: 'old', status: 'failed', items: [], error: { message: 'Old failure' } }], backwardsCursor: 'checkpoint' }
+    : original(method, params);
+  await f.controller.watch('beta', false);
+  assert.equal(f.sent.length, 0);
+});
+
+test('rate-limited reconnect recovery resumes while the daemon socket stays healthy', async () => {
+  const f = fixture(); const original = f.codex.request.bind(f.codex); const send = f.telegram.send;
+  f.store.data.threads.alpha.cursor = 'old'; f.store.save();
+  f.codex.request = async (method, params) => method === 'thread/turns/list' ? {
+    data: [{ id: 'offline', status: 'completed', items: [
+      { id: 'first', type: 'agentMessage', text: 'First missed reply' },
+      { id: 'second', type: 'agentMessage', text: 'Second missed reply' },
+    ] }], backwardsCursor: 'new',
+  } : original(method, params);
+  f.telegram.send = async () => { throw { error_code: 429 }; };
+  await assert.rejects(f.controller.reconnect(), /rate limited/);
+  assert.equal(f.store.data.threads.alpha.cursor, 'old');
+  f.telegram.send = send; await f.controller.flush();
+  assert.equal(f.sent.length, 1);
+  await f.controller.retryRecovery(Date.now() + 60000);
+  assert.deepEqual(f.sent.map(m => m.text.split('\n').at(-1)), ['First missed reply', 'Second missed reply']);
+  assert.equal(f.store.data.threads.alpha.cursor, 'new');
+  assert.equal(f.store.data.threads.alpha.lastError, undefined);
+  assert.ok(f.calls.every(c => c.method === 'thread/resume'));
+});
+
+test('history retries back off and stop after recovery succeeds', async () => {
+  const f = fixture(); let calls = 0;
+  f.codex.request = async () => { calls++; throw new Error('Temporarily unavailable'); };
+  const before = Date.now(); await assert.rejects(f.controller.reconcile('alpha'));
+  await f.controller.retryRecovery(before); assert.equal(calls, 1);
+  await f.controller.retryRecovery(before + 60000); assert.equal(calls, 2);
+  await f.controller.retryRecovery(before); assert.equal(calls, 2);
+  f.codex.request = async () => { calls++; return { data: [], backwardsCursor: 'checkpoint' }; };
+  await f.controller.retryRecovery(before + 120000); const recoveredCalls = calls;
+  await f.controller.retryRecovery(before + 180000); assert.equal(calls, recoveredCalls);
+});
+
+test('unwatched or revoked recovery work is not retried', async () => {
+  const f = fixture(); let allowed = true; let calls = 0;
+  const controller = new Controller(f.store, f.codex, f.telegram, [], () => allowed);
+  f.codex.request = async () => { calls++; throw new Error('Unavailable'); };
+  await assert.rejects(controller.reconcile('alpha'));
+  allowed = false; await controller.retryRecovery(Date.now() + 60000); assert.equal(calls, 1);
+  allowed = true; f.store.data.watched = []; await controller.retryRecovery(Date.now() + 120000); assert.equal(calls, 1);
+});
+
+
+test('a turn completing during an existing scan triggers a follow-up scan', async () => {
+  const f = fixture(); let release, started;
+  const scanning = new Promise(resolve => { started = resolve; });
+  let scans = 0;
+  f.codex.request = async (method, params) => {
+    if (params.sortDirection === 'desc') return { data: [], backwardsCursor: 'checkpoint' };
+    scans++;
+    if (scans === 1) { started(); await new Promise(resolve => { release = resolve; }); return { data: [{ id: 'turn', status: 'inProgress', items: [] }] }; }
+    return { data: [{ id: 'turn', status: 'completed', items: [{ id: 'final', type: 'agentMessage', text: 'Finished during scan' }] }] };
+  };
+  const first = f.controller.reconcile('alpha'); await scanning;
+  const next = f.controller.reconcile('alpha'); release(); await Promise.all([first, next]);
+  assert.equal(scans, 2); assert.equal(f.sent.length, 1); assert.match(f.sent[0].text, /Finished during scan/);
+});

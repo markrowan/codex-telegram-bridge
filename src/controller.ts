@@ -29,6 +29,9 @@ export class Controller {
   private fileItems = new Map<string, any>();
   private flushing?: Promise<void>;
   private reconnecting = false;
+  private recovering = new Map<string, Promise<void>>();
+  private recoveryAgain = new Set<string>();
+  private recoveryRetries = new Map<string, { failures: number; after: number }>();
 
   constructor(readonly store: Store, readonly codex: CodexPort, readonly telegram: TelegramPort, readonly projects: Project[], private readonly allowed: () => boolean = () => true) {}
   label(id: string): string {
@@ -244,9 +247,12 @@ export class Controller {
     if (!old?.baseline) {
       const latest = await this.history({ threadId: id, limit: 1, sortDirection: 'desc', itemsView: 'full' });
       this.store.data.threads[id] = { ...old, name: old?.name || 'Codex', cursor: latest.backwardsCursor, baseline: true };
-      for (const turn of latest.data ?? []) for (const item of turn.items ?? []) {
-        const text = messageText(item);
-        if (text) this.store.data.deliveries[this.itemKey(id, item.id, text)] = { text: '', state: 'sent' };
+      for (const turn of latest.data ?? []) {
+        if (['failed', 'interrupted'].includes(turn.status)) this.store.data.deliveries[`turn:${id}:${turn.id}`] = { text: '', state: 'sent' };
+        for (const item of turn.items ?? []) {
+          const text = messageText(item);
+          if (text) this.store.data.deliveries[this.itemKey(id, item.id, text)] = { text: '', state: 'sent' };
+        }
       }
       this.store.save();
     }
@@ -274,7 +280,42 @@ export class Controller {
     const ids = await this.send(key, `${this.label(threadId)}\n${text}`, undefined, undefined, true);
     if (ids.length) { this.store.data.deliveries[key] = { text: '', state: 'sent' }; this.store.save(); }
   }
+  private async relayOutcome(threadId: string, turn: any): Promise<void> {
+    if (!['failed', 'interrupted'].includes(turn?.status)) return;
+    const key = `turn:${threadId}:${turn.id}`;
+    if (this.store.data.deliveries[key]?.state === 'sent') return;
+    const ids = await this.send(key, `${this.label(threadId)} Turn ${turn.status}.${turn.error?.message ? '\n' + turn.error.message : ''}`);
+    if (ids.length) { this.store.data.deliveries[key] = { text: '', state: 'sent' }; this.store.save(); }
+  }
+  private recoveryFailed(threadId: string, error: unknown): void {
+    const failures = (this.recoveryRetries.get(threadId)?.failures ?? 0) + 1;
+    this.recoveryRetries.set(threadId, { failures, after: Date.now() + Math.min(30000, 1000 * 2 ** Math.min(failures - 1, 5)) });
+    this.store.data.threads[threadId].lastError = (error as Error).message; this.store.save();
+  }
+  async retryRecovery(now = Date.now()): Promise<void> {
+    if (!this.allowed() || !this.codex.connected || this.reconnecting) return;
+    for (const [id, retry] of [...this.recoveryRetries]) {
+      if (!this.store.data.watched.includes(id)) { this.recoveryRetries.delete(id); continue; }
+      if (retry.after > now || this.recovering.has(id)) continue;
+      // Failure schedules bounded backoff and remains visible in /status.
+      try { await this.reconcile(id); } catch {}
+    }
+  }
   async reconcile(threadId: string): Promise<void> {
+    const pending = this.recovering.get(threadId);
+    if (pending) { this.recoveryAgain.add(threadId); return pending; }
+    const task = (async () => {
+      do {
+        this.recoveryAgain.delete(threadId);
+        await this.reconcileHistory(threadId);
+      } while (this.recoveryAgain.has(threadId) && this.store.data.watched.includes(threadId) && this.allowed());
+    })();
+    this.recovering.set(threadId, task);
+    try { await task; this.recoveryRetries.delete(threadId); }
+    catch (error) { this.recoveryFailed(threadId, error); throw error; }
+    finally { this.recovering.delete(threadId); }
+  }
+  private async reconcileHistory(threadId: string): Promise<void> {
     const state = this.store.data.threads[threadId];
     // Snapshot before scanning: turns completed during delivery must remain recoverable.
     // backwardsCursor includes this last turn when read in ascending order.
@@ -284,7 +325,10 @@ export class Controller {
       const result = await this.history({ threadId, limit: 50, sortDirection: 'asc', itemsView: 'full', ...(cursor ? { cursor } : {}) });
       for (const turn of result.data ?? []) {
         state.activeTurn = turn.status === 'inProgress' ? turn.id : undefined;
-        if (turn.status !== 'inProgress') for (const item of turn.items ?? []) await this.relayItem(threadId, item);
+        if (turn.status !== 'inProgress') {
+          for (const item of turn.items ?? []) await this.relayItem(threadId, item);
+          await this.relayOutcome(threadId, turn);
+        }
       }
       if (!result.nextCursor) break;
       cursor = result.nextCursor;
@@ -319,9 +363,8 @@ export class Controller {
     if (message.method === 'turn/completed') {
       this.store.data.threads[p.threadId].activeTurn = undefined; this.store.save();
       await this.invalidate(r => r.threadId === p.threadId && r.turnId === p.turn?.id, 'Turn ended');
-      if (p.turn?.status === 'failed' || p.turn?.status === 'interrupted') {
-        await this.send(`turn:${p.threadId}:${p.turn.id}`, `${this.label(p.threadId)} Turn ${p.turn.status}.${p.turn.error?.message ? '\n' + p.turn.error.message : ''}`);
-      }
+      try { await this.relayOutcome(p.threadId, p.turn); }
+      catch (error) { this.recoveryFailed(p.threadId, error); throw error; }
       await this.reconcile(p.threadId);
     }
   }

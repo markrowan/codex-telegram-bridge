@@ -56,7 +56,7 @@ async function connectLoop(): Promise<void> {
     if (!codex.connected) {
       try { await codex.connect(); await controller.reconnect(); backoff = 1000; }
       catch (error) { log(error); await delay(backoff); backoff = Math.min(backoff * 2, 30000); }
-    } else await delay(1000);
+    } else { await controller.retryRecovery(); await delay(1000); }
   }
 }
 
