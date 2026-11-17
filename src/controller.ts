@@ -208,13 +208,18 @@ export class Controller {
       : { decision: accept ? 'accept' : 'decline' };
     await this.respond(prompt, result, updateId);
   }
-  private async threadPicker(key: string, cursor?: string): Promise<void> {
-    const loaded = await this.codex.request('thread/loaded/list', {});
-    const page = await this.codex.request('thread/list', { limit: 8, sortKey: 'updated_at', ...(cursor ? { cursor } : {}) });
-    const ids = new Set<string>(cursor ? [] : loaded.data ?? []);
-    for (const t of page.data ?? []) ids.add(t.id);
+  private async threadPicker(key: string, cursor?: string, remainingIds?: string[]): Promise<void> {
+    let ids = remainingIds;
+    let nextCursor = cursor;
+    if (!ids) {
+      const loaded = cursor ? { data: [] } : await this.codex.request('thread/loaded/list', {});
+      const page = await this.codex.request('thread/list', { limit: 8, sortKey: 'updated_at', ...(cursor ? { cursor } : {}) });
+      ids = [...new Set<string>([...(page.data ?? []).map((t: any) => t.id), ...(loaded.data ?? [])])];
+      nextCursor = page.nextCursor;
+    }
+    const remaining = ids.slice(8);
     const rows = [];
-    for (const id of [...ids].slice(0, 20)) {
+    for (const id of ids.slice(0, 8)) {
       const result = await this.codex.request('thread/read', { threadId: id, includeTurns: false });
       const t = result.thread;
       if (t.source && typeof t.source === 'object' && ('subAgent' in t.source || t.source.kind === 'subAgent')) continue;
@@ -222,7 +227,7 @@ export class Controller {
       const info = `${name} · ${basename(t.cwd || 'project').slice(0, 20)} · ${t.status?.type || 'stored'} · ${id.slice(0, 8)}`;
       rows.push([this.button(info, async updateId => { await this.watch(id, true); await this.send(`selected:${updateId}`, `${this.label(id)} Selected; notifications enabled.`); })]);
     }
-    if (page.nextCursor) rows.push([this.button('More threads', id => this.threadPicker(`page:${id}`, page.nextCursor))]);
+    if (remaining.length || nextCursor) rows.push([this.button('More threads', id => this.threadPicker(`page:${id}`, nextCursor, remaining.length ? remaining : undefined))]);
     await this.send(key, rows.length ? 'Choose a Codex conversation:' : 'No conversations found. Use /new.', { reply_markup: { inline_keyboard: rows } });
   }
   private async history(params: Record<string, any>): Promise<any> {
@@ -270,6 +275,9 @@ export class Controller {
   }
   async reconcile(threadId: string): Promise<void> {
     const state = this.store.data.threads[threadId];
+    // Snapshot before scanning: turns completed during delivery must remain recoverable.
+    // backwardsCursor includes this last turn when read in ascending order.
+    const checkpoint = await this.history({ threadId, limit: 1, sortDirection: 'desc', itemsView: 'notLoaded' });
     let cursor = state.cursor;
     for (let page = 0; page < 100; page++) {
       const result = await this.history({ threadId, limit: 50, sortDirection: 'asc', itemsView: 'full', ...(cursor ? { cursor } : {}) });
@@ -281,9 +289,7 @@ export class Controller {
       cursor = result.nextCursor;
       if (page === 99) throw new Error('History reconciliation limit reached; review the conversation in ChatGPT');
     }
-    const latest = await this.history({ threadId, limit: 1, sortDirection: 'desc', itemsView: 'full' });
-    for (const turn of latest.data ?? []) if (turn.status !== 'inProgress') for (const item of turn.items ?? []) await this.relayItem(threadId, item);
-    state.cursor = latest.backwardsCursor; state.lastError = undefined; this.store.save();
+    state.cursor = checkpoint.backwardsCursor; state.lastError = undefined; this.store.save();
   }
   async reconnect(): Promise<void> {
     this.reconnecting = true;

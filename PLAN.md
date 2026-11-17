@@ -26,3 +26,11 @@ Order considered: delete -> simplify -> reuse -> extend -> create. Reuse upstrea
 - [x] Verify regression tests and build; publish the correction and retain CI outcomes on the PR. Existing installation stays inactive; Telegram acceptance and any updated installation remain separate.
 
 Dependency restoration also reported ws advisories; update its existing major-version-8 dependency and lockfile to the patched release. No new dependency or service is introduced.
+
+## Picker and recovery review corrections
+
+- [x] Reproduce dropped picker entries with 25 loaded threads and distinct recent conversations, and lost intervening replies during history recovery.
+- [x] Paginate the combined picker without discarding entries; capture the recovery checkpoint before scanning and commit only after all pages are processed.
+- [x] Verify bounded pagination, concurrent completions, paged history and failed-delivery behavior. Record publication and exact-head CI evidence on the PR and private handoff.
+
+Scope: bridge code/tests and updating the bridge release used for acceptance. Restart only the bridge process if running; keep startup disabled. No Codex daemon restart, existing-thread turn, or automatic repetition of uncertain operations. Telegram acceptance remains outstanding.

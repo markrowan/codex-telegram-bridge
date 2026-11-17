@@ -324,3 +324,90 @@ test('a card resolved during an in-flight send is expired on delivery', async ()
   await f.controller.process(f.callback(1, f.sent[0].extra.reply_markup.inline_keyboard[0][0].callback_data));
   assert.equal(f.responses.length, 0);
 });
+
+test('the picker preserves recent and loaded threads across bounded pages', async () => {
+  for (const extraPage of [false, true]) {
+    const f = fixture(); const original = f.codex.request.bind(f.codex);
+    const loaded = Array.from({ length: 25 }, (_, i) => `loaded-${i}`);
+    const recent = Array.from({ length: 8 }, (_, i) => `recent-${i}`);
+    f.codex.request = async (method, params) => {
+      if (method === 'thread/loaded/list') return { data: loaded };
+      if (method === 'thread/list') return params.cursor
+        ? { data: [{ id: 'older' }] }
+        : { data: recent.map(id => ({ id })), ...(extraPage ? { nextCursor: 'older-page' } : {}) };
+      return original(method, params);
+    };
+    await f.controller.process(f.message(1, '/threads'));
+    const seen = new Set(); let update = 2; let largestPage = 0;
+    for (let page = 0; page < 10; page++) {
+      const card = f.sent.at(-1);
+      const buttons = card.extra.reply_markup.inline_keyboard.flat();
+      const choices = buttons.filter(b => b.text !== 'More threads');
+      largestPage = Math.max(largestPage, choices.length);
+      for (const b of choices) seen.add(b.text.split(' · ')[0]);
+      const more = buttons.find(b => b.text === 'More threads');
+      if (!more) break;
+      await f.controller.process(f.callback(update++, more.callback_data));
+      if (page === 9) assert.fail('Picker did not finish');
+    }
+    assert.deepEqual([...seen].sort(), [...loaded, ...recent, ...(extraPage ? ['older'] : [])].sort());
+    assert.ok(largestPage <= 8);
+    assert.equal(f.store.data.selected, 'alpha');
+  }
+});
+
+test('recovery never checkpoints beyond replies scanned while new turns finish', async () => {
+  const f = fixture();
+  const turn = id => ({ id, status: 'completed', items: [{ id: `${id}-reply`, type: 'agentMessage', text: `${id} answer` }] });
+  const turns = [turn('one')]; let added = false;
+  f.store.data.threads.alpha.cursor = 'from:0'; f.store.save();
+  f.codex.request = async (method, params) => {
+    assert.equal(method, 'thread/turns/list');
+    if (params.sortDirection === 'desc') return { data: [turns.at(-1)], backwardsCursor: `from:${turns.length - 1}` };
+    const start = Number((params.cursor ?? 'from:0').split(':')[1]);
+    const data = turns.slice(start);
+    if (!added) { turns.push(turn('middle'), turn('newest')); added = true; }
+    return { data };
+  };
+  await f.controller.reconcile('alpha');
+  await f.controller.reconcile('alpha');
+  assert.deepEqual(f.sent.map(m => m.text.split('\n').at(-1)), ['one answer', 'middle answer', 'newest answer']);
+  assert.equal(f.store.data.threads.alpha.cursor, 'from:2');
+});
+
+test('recovery scans every history page before committing its starting checkpoint', async () => {
+  const f = fixture(); const cursors = [];
+  f.store.data.threads.alpha.cursor = 'old';
+  f.codex.request = async (method, params) => {
+    if (params.sortDirection === 'desc') return { data: [], backwardsCursor: 'checkpoint' };
+    cursors.push(params.cursor);
+    const last = params.cursor === 'page-2';
+    return { data: [{ id: last ? 'b' : 'a', status: 'completed', items: [{ id: last ? 'b-reply' : 'a-reply', type: 'agentMessage', text: last ? 'Second' : 'First' }] }], ...(last ? {} : { nextCursor: 'page-2' }) };
+  };
+  await f.controller.reconcile('alpha');
+  assert.deepEqual(cursors, ['old', 'page-2']);
+  assert.equal(f.sent.length, 2); assert.equal(f.store.data.threads.alpha.cursor, 'checkpoint');
+});
+
+test('failed recovery delivery keeps its previous checkpoint', async () => {
+  const f = fixture(); f.store.data.threads.alpha.cursor = 'old'; f.store.save();
+  f.codex.request = async (method, params) => params.sortDirection === 'desc'
+    ? { data: [], backwardsCursor: 'new' }
+    : { data: [{ id: 'turn', status: 'completed', items: [{ id: 'reply', type: 'agentMessage', text: 'Answer' }] }] };
+  f.telegram.send = async () => { throw { error_code: 429 }; };
+  await assert.rejects(f.controller.reconcile('alpha'));
+  assert.equal(f.store.data.threads.alpha.cursor, 'old');
+});
+
+
+test('an in-progress checkpoint is revisited after its turn completes', async () => {
+  const f = fixture(); let status = 'inProgress';
+  f.codex.request = async (method, params) => {
+    if (params.sortDirection === 'desc') return { data: [{ id: 'live', status }], backwardsCursor: 'before-live' };
+    assert.ok(params.cursor === undefined || params.cursor === 'before-live');
+    return { data: [{ id: 'live', status, items: [{ id: 'reply', type: 'agentMessage', text: 'Completed reply' }] }] };
+  };
+  await f.controller.reconcile('alpha'); assert.equal(f.sent.length, 0);
+  status = 'completed'; await f.controller.reconcile('alpha');
+  assert.equal(f.sent.length, 1); assert.match(f.sent[0].text, /Completed reply/);
+});
