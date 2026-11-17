@@ -519,3 +519,35 @@ test('a turn completing during an existing scan triggers a follow-up scan', asyn
   const next = f.controller.reconcile('alpha'); release(); await Promise.all([first, next]);
   assert.equal(scans, 2); assert.equal(f.sent.length, 1); assert.match(f.sent[0].text, /Finished during scan/);
 });
+
+
+test('a failed watched subscription retries on a healthy socket with inherited settings', async () => {
+  const f = fixture(); const original = f.codex.request.bind(f.codex); let resumes = 0;
+  f.codex.request = async (method, params) => {
+    if (method === 'thread/resume') {
+      resumes++;
+      assert.deepEqual(params, { threadId: 'alpha', excludeTurns: true });
+      if (resumes === 1) throw new Error('Transient subscription failure');
+    }
+    return original(method, params);
+  };
+  await f.controller.reconnect();
+  assert.equal(resumes, 1); assert.match(f.store.data.threads.alpha.lastError, /subscription failure/);
+  await f.controller.retryRecovery(Date.now() + 60000);
+  assert.equal(resumes, 2); assert.equal(f.store.data.threads.alpha.lastError, undefined);
+  await f.controller.notification({ method: 'item/completed', params: { threadId: 'alpha', item: { id: 'restored', type: 'agentMessage', text: 'Restored activity' } } });
+  assert.equal(f.sent.length, 1); assert.match(f.sent[0].text, /Restored activity/);
+  await f.controller.retryRecovery(Date.now() + 120000); assert.equal(resumes, 2);
+});
+
+test('a newly selected thread whose subscription fails is rolled back without background retries', async () => {
+  const f = fixture(); const original = f.codex.request.bind(f.codex); let resumes = 0;
+  f.codex.request = async (method, params) => {
+    if (method === 'thread/resume') { resumes++; throw new Error('Unavailable'); }
+    return original(method, params);
+  };
+  await assert.rejects(f.controller.watch('beta', true));
+  assert.equal(f.store.data.watched.includes('beta'), false);
+  await f.controller.retryRecovery(Date.now() + 60000);
+  assert.equal(resumes, 1); assert.equal(f.store.data.selected, 'alpha');
+});

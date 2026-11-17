@@ -50,3 +50,7 @@ No new service or configuration is needed. Existing dispatch/approval and Codex 
 - [x] Test recovery failures/retries, live/history deduplication, concurrent scan requests and backoff; pass local checks. Retain exact-head CI, completed review, conditional fork-main merge and acceptance-release deployment evidence on the PR and private handoff.
 
 Use the existing controller/connect loop; no added service or daemon lifecycle control. Full paired acceptance remains a separate outstanding gate.
+
+### Subscription retry follow-up
+
+- [x] A final-head review found that transient thread/resume failures were recorded but not retried. Extend the existing retry entry to retain subscription work, retry watch with inherited settings, and test a healthy-socket restoration before merge. No separate retry service or new configuration.

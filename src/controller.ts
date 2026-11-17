@@ -31,7 +31,7 @@ export class Controller {
   private reconnecting = false;
   private recovering = new Map<string, Promise<void>>();
   private recoveryAgain = new Set<string>();
-  private recoveryRetries = new Map<string, { failures: number; after: number }>();
+  private recoveryRetries = new Map<string, { failures: number; after: number; subscription: boolean }>();
 
   constructor(readonly store: Store, readonly codex: CodexPort, readonly telegram: TelegramPort, readonly projects: Project[], private readonly allowed: () => boolean = () => true) {}
   label(id: string): string {
@@ -262,6 +262,7 @@ export class Controller {
     try { resumed = createdThread ? { thread: createdThread } : await this.codex.request('thread/resume', { threadId: id, excludeTurns: true }); }
     catch (error) {
       if (!alreadyWatched) this.store.data.watched = this.store.data.watched.filter(value => value !== id);
+      else this.recoveryFailed(id, error, true);
       this.store.save(); await this.invalidate(p => p.threadId === id, 'Thread subscription failed'); throw error;
     }
     const t = resumed.thread;
@@ -287,9 +288,9 @@ export class Controller {
     const ids = await this.send(key, `${this.label(threadId)} Turn ${turn.status}.${turn.error?.message ? '\n' + turn.error.message : ''}`);
     if (ids.length) { this.store.data.deliveries[key] = { text: '', state: 'sent' }; this.store.save(); }
   }
-  private recoveryFailed(threadId: string, error: unknown): void {
+  private recoveryFailed(threadId: string, error: unknown, subscription = false): void {
     const failures = (this.recoveryRetries.get(threadId)?.failures ?? 0) + 1;
-    this.recoveryRetries.set(threadId, { failures, after: Date.now() + Math.min(30000, 1000 * 2 ** Math.min(failures - 1, 5)) });
+    this.recoveryRetries.set(threadId, { failures, subscription: subscription || !!this.recoveryRetries.get(threadId)?.subscription, after: Date.now() + Math.min(30000, 1000 * 2 ** Math.min(failures - 1, 5)) });
     this.store.data.threads[threadId].lastError = (error as Error).message; this.store.save();
   }
   async retryRecovery(now = Date.now()): Promise<void> {
@@ -298,7 +299,7 @@ export class Controller {
       if (!this.store.data.watched.includes(id)) { this.recoveryRetries.delete(id); continue; }
       if (retry.after > now || this.recovering.has(id)) continue;
       // Failure schedules bounded backoff and remains visible in /status.
-      try { await this.reconcile(id); } catch {}
+      try { if (retry.subscription) await this.watch(id, false); else await this.reconcile(id); } catch {}
     }
   }
   async reconcile(threadId: string): Promise<void> {
