@@ -54,6 +54,8 @@ Ordinary text starts a turn when idle or steers an active turn immediately. A ra
 
 Watched conversations relay completed user-facing progress, plans, final replies and failures, even when work starts in ChatGPT. Messages include the thread label; raw tool output is excluded. Newly watched threads do not dump old history. Reconnection uses the stored history cursor to recover missed replies.
 
+Assistant replies render Markdown as native Telegram entities: bold, italic, strikethrough, links, inline code and fenced code blocks. Headings use bold text; lists keep their hierarchy, quotes use a visible prefix, and tables use readable text rows. Raw HTML stays literal. Formatting survives long-message splitting, including code whitespace and emoji. Approval action details remain literal so their commands and paths are displayed exactly.
+
 ## Approvals and questions
 
 Command and file requests offer one-action decisions. Explicit permission grants apply to the displayed requested permissions for the current turn only. There is no session-grant or policy-amendment control. Read the displayed request before approving it.

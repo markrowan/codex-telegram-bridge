@@ -46,7 +46,9 @@
     "SECURITY.md"
   ],
   "dependencies": {
+    "entities": "^9.0.0",
     "grammy": "^1.42.0",
+    "marked": "^18.2.1",
     "ws": "^8.23.0"
   },
   "devDependencies": {

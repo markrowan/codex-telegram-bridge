@@ -3,6 +3,7 @@ import { basename } from 'node:path';
 import { chunkText } from './common.js';
 import { RpcError, type CodexPort } from './codex-client.js';
 import { Store } from './store.js';
+import { markdownChunks } from './markdown.js';
 
 export interface TelegramPort {
   send(chatId: string, text: string, extra?: any): Promise<{ message_id: number }>;
@@ -37,17 +38,17 @@ export class Controller {
     if (!this.store.data.owner) throw new Error('Pair a private Telegram account locally first');
     return this.store.data.owner;
   }
-  private async send(key: string, text: string, extra?: any, prompt?: Prompt): Promise<number[]> {
+  private async send(key: string, text: string, extra?: any, prompt?: Prompt, markdown = false): Promise<number[]> {
     const newline = text.indexOf('\n');
     const header = text.startsWith('[') && newline > 0 ? text.slice(0, newline) : '';
     const body = header ? text.slice(newline + 1) : text;
     const parts = chunkText(body, 3800 - header.length - 25);
-    const chunks = parts.map((part, i) => `${header ? header + (parts.length > 1 ? ` (${i + 1}/${parts.length})` : '') + '\n' : ''}${part}`);
+    const chunks = markdown ? markdownChunks(body, header) : parts.map((part, i) => ({ text: `${header ? header + (parts.length > 1 ? ` (${i + 1}/${parts.length})` : '') + '\n' : ''}${part}`, entities: undefined }));
     if (prompt) {
       prompt.messages = [];
       prompt.deliveryKeys = chunks.map((_, index) => `${key}:${index}`);
     }
-    chunks.forEach((part, index) => this.store.enqueue(`${key}:${index}`, part, index === chunks.length - 1 ? extra : undefined));
+    chunks.forEach((part, index) => this.store.enqueue(`${key}:${index}`, part.text, { ...(part.entities ? { entities: part.entities } : {}), ...(index === chunks.length - 1 ? extra : {}) }));
     await this.flush();
     if (chunks.some((_, index) => this.store.data.deliveries[`${key}:${index}`]?.state !== 'sent')) return [];
     return chunks.flatMap((_, index) => {
@@ -270,7 +271,7 @@ export class Controller {
     if (!text || !item.id) return;
     const key = this.itemKey(threadId, item.id, text);
     if (this.store.data.deliveries[key]?.state === 'sent') return;
-    const ids = await this.send(key, `${this.label(threadId)}\n${text}`);
+    const ids = await this.send(key, `${this.label(threadId)}\n${text}`, undefined, undefined, true);
     if (ids.length) { this.store.data.deliveries[key] = { text: '', state: 'sent' }; this.store.save(); }
   }
   async reconcile(threadId: string): Promise<void> {

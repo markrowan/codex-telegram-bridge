@@ -411,3 +411,26 @@ test('an in-progress checkpoint is revisited after its turn completes', async ()
   status = 'completed'; await f.controller.reconcile('alpha');
   assert.equal(f.sent.length, 1); assert.match(f.sent[0].text, /Completed reply/);
 });
+
+
+test('assistant Markdown is journaled with formatting and delivered only once', async () => {
+  const f = fixture(); const event = { method: 'item/completed', params: { threadId: 'alpha', item: { id: 'md', type: 'agentMessage', text: '**Hello** `world`' } } };
+  const send = f.telegram.send;
+  f.telegram.send = async () => { throw { error_code: 429 }; };
+  await assert.rejects(f.controller.notification(event), /rate limited/);
+  const queued = Object.values(f.store.data.deliveries).find(d => d.state === 'queued');
+  assert.equal(queued.text, '[Alpha · alpha]\nHello world');
+  assert.deepEqual(queued.extra.entities.map(e => e.type), ['bold', 'code']);
+  const recovered = new Store(f.file);
+  const controller = new Controller(recovered, f.codex, f.telegram, []);
+  f.telegram.send = send; await controller.flush(); await controller.notification(event);
+  assert.equal(f.sent.length, 1);
+  assert.deepEqual(f.sent[0].extra.entities, queued.extra.entities);
+});
+
+test('approval commands remain literal even when they contain Markdown punctuation', async () => {
+  const f = fixture(); const request = command(); request.params.command = 'echo **literal** _file_ `value`';
+  await f.controller.serverRequest(request);
+  assert.match(f.sent[0].text, /echo \*\*literal\*\* _file_ `value`/);
+  assert.equal(f.sent[0].extra.entities, undefined);
+});

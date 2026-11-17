@@ -34,3 +34,11 @@ Dependency restoration also reported ws advisories; update its existing major-ve
 - [x] Verify bounded pagination, concurrent completions, paged history and failed-delivery behavior. Record publication and exact-head CI evidence on the PR and private handoff.
 
 Scope: bridge code/tests and updating the bridge release used for acceptance. Restart only the bridge process if running; keep startup disabled. No Codex daemon restart, existing-thread turn, or automatic repetition of uncertain operations. Telegram acceptance remains outstanding.
+
+## Telegram Markdown rendering
+
+- [x] Render assistant Markdown with Telegram message entities using a maintained Markdown parser; support emphasis, links, code, headings, lists and quotes, with readable tables. Keep raw HTML literal and action details unchanged.
+- [x] Split rendered text into labelled Telegram-sized chunks, clipping entity offsets safely across chunk boundaries and preserving emoji/code whitespace. Persist the resulting payloads in the existing delivery journal.
+- [x] Test formatting, nesting, Unicode, incomplete Markdown, long code blocks, replay/dedup and retry persistence; pass build/type checks. Publication, exact-head CI and acceptance-release deployment receipts are retained on the PR and outside Git. Preserve pairing and keep startup disabled.
+
+No new service or configuration is needed. Existing dispatch/approval and Codex daemon settings remain unchanged. Telegram visual acceptance remains an explicit check after deployment.
