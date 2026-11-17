@@ -13,7 +13,7 @@ export type Project = { name: string; cwd: string };
 type Route = { epoch: number; run: (updateId: number) => Promise<void> };
 type Prompt = {
   token: string; id: number | string; threadId: string; turnId: string; epoch: number;
-  method: string; params: any; messages: number[]; active: boolean; sending: boolean;
+  method: string; params: any; messages: number[]; deliveryKeys: string[]; active: boolean; sending: boolean;
   answers: Record<string, { answers: string[] }>; question?: number; expires?: number; updateId?: number;
 };
 
@@ -37,12 +37,16 @@ export class Controller {
     if (!this.store.data.owner) throw new Error('Pair a private Telegram account locally first');
     return this.store.data.owner;
   }
-  private async send(key: string, text: string, extra?: any): Promise<number[]> {
+  private async send(key: string, text: string, extra?: any, prompt?: Prompt): Promise<number[]> {
     const newline = text.indexOf('\n');
     const header = text.startsWith('[') && newline > 0 ? text.slice(0, newline) : '';
     const body = header ? text.slice(newline + 1) : text;
     const parts = chunkText(body, 3800 - header.length - 25);
     const chunks = parts.map((part, i) => `${header ? header + (parts.length > 1 ? ` (${i + 1}/${parts.length})` : '') + '\n' : ''}${part}`);
+    if (prompt) {
+      prompt.messages = [];
+      prompt.deliveryKeys = chunks.map((_, index) => `${key}:${index}`);
+    }
     chunks.forEach((part, index) => this.store.enqueue(`${key}:${index}`, part, index === chunks.length - 1 ? extra : undefined));
     await this.flush();
     if (chunks.some((_, index) => this.store.data.deliveries[`${key}:${index}`]?.state !== 'sent')) return [];
@@ -64,12 +68,21 @@ export class Controller {
   private async flushQueued(): Promise<void> {
     while (true) {
       if (!this.allowed()) return;
-      const delivery = Object.values(this.store.data.deliveries).find(value => value.state === 'queued');
-      if (!delivery) break;
+      const entry = Object.entries(this.store.data.deliveries).find(([, value]) => value.state === 'queued');
+      if (!entry) break;
+      const [key, delivery] = entry;
+      const prompt = [...this.prompts.values()].find(p => p.deliveryKeys.includes(key));
       delivery.state = 'sending'; this.store.save();
       try {
         const message = await this.telegram.send(this.owner().chatId, delivery.text, delivery.extra);
         delivery.messageId = message.message_id; delivery.state = 'sent'; delivery.text = ''; delete delivery.extra; this.store.save();
+        if (prompt) {
+          if (!prompt.active) {
+            await this.editExpired({ ...prompt, messages: [message.message_id] }, 'Resolved while the card was being delivered');
+          } else if (prompt.deliveryKeys.every(k => this.store.data.deliveries[k]?.state === 'sent')) {
+            prompt.messages = prompt.deliveryKeys.map(k => this.store.data.deliveries[k].messageId!);
+          }
+        }
       } catch (error: any) {
         // Telegram explicitly rejected 429 requests, so retrying these is safe.
         delivery.state = error?.error_code === 429 ? 'queued' : 'uncertain'; this.store.save();
@@ -321,7 +334,7 @@ export class Controller {
     if (!supported.includes(request.method)) {
       await this.send(`unsupported:${this.codex.epoch}:${request.id}`, `${this.label(params.threadId)} A request requires ChatGPT: ${request.method}`); return;
     }
-    const prompt: Prompt = { token: randomBytes(12).toString('hex'), id: request.id, threadId: params.threadId, turnId: params.turnId, epoch: this.codex.epoch, method: request.method, params, messages: [], active: true, sending: false, answers: {}, expires: params.autoResolutionMs ? Date.now() + params.autoResolutionMs : undefined };
+    const prompt: Prompt = { token: randomBytes(12).toString('hex'), id: request.id, threadId: params.threadId, turnId: params.turnId, epoch: this.codex.epoch, method: request.method, params, messages: [], deliveryKeys: [], active: true, sending: false, answers: {}, expires: params.autoResolutionMs ? Date.now() + params.autoResolutionMs : undefined };
     this.prompts.set(prompt.token, prompt);
     if (prompt.method === 'item/tool/requestUserInput') {
       if (!Array.isArray(params.questions) || !params.questions.length || params.questions.some((q: any) => q.isSecret)) {
@@ -352,16 +365,14 @@ export class Controller {
     const available: string[] = params.availableDecisions ?? ['accept', 'decline'];
     const buttons = ['accept', 'decline'].filter(value => available.includes(value)).map(value => ({ text: value === 'accept' ? 'Approve once' : 'Decline', callback_data: `a:${prompt.token}:${value}` }));
     if (!buttons.length) { prompt.active = false; await this.send(`unsupported:${prompt.token}`, `${this.label(params.threadId)} This request requires a decision in ChatGPT.`); return; }
-    prompt.messages = await this.send(`request:${prompt.epoch}:${prompt.id}`, text, { reply_markup: { inline_keyboard: [buttons] } });
-    if (!prompt.active) await this.editExpired(prompt, 'Resolved while the card was being delivered');
+    await this.send(`request:${prompt.token}`, text, { reply_markup: { inline_keyboard: [buttons] } }, prompt);
   }
   private async showQuestion(prompt: Prompt): Promise<void> {
     const q = prompt.params.questions[prompt.question!];
     const text = `${this.label(prompt.threadId)}\n${q.header || 'Question'}: ${q.question}\n${(q.options ?? []).map((o: any, i: number) => `${i + 1}. ${o.label}${o.description ? ' — ' + o.description : ''}`).join('\n')}\nReply to this message to enter your own answer.`;
-    prompt.messages = await this.send(`question:${prompt.token}:${prompt.question}`, text, {
+    await this.send(`question:${prompt.token}:${prompt.question}`, text, {
       reply_markup: { inline_keyboard: (q.options ?? []).map((o: any, i: number) => [{ text: o.label.slice(0, 100), callback_data: `q:${prompt.token}:${prompt.question}:${i}` }]) },
-    });
-    if (!prompt.active) await this.editExpired(prompt, 'Question resolved');
+    }, prompt);
   }
   private async answerQuestion(prompt: Prompt, text: string, updateId: number): Promise<void> {
     if (!this.valid(prompt)) throw new Error('The question expired');
@@ -392,7 +403,7 @@ export class Controller {
       prompt.active = false;
       if (prompt.updateId !== undefined && reason === 'Resolved in Codex') this.store.update(prompt.updateId, { state: 'accepted' });
       for (const [key, delivery] of Object.entries(this.store.data.deliveries)) {
-        if ((key.startsWith(`request:${prompt.epoch}:${prompt.id}:`) || key.startsWith(`question:${prompt.token}:`)) && delivery.state === 'queued') delivery.state = 'cancelled';
+        if ((key.startsWith(`request:${prompt.token}:`) || key.startsWith(`question:${prompt.token}:`)) && delivery.state === 'queued') delivery.state = 'cancelled';
       }
     }
     if (affected.length) this.store.save();

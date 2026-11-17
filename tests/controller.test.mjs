@@ -216,3 +216,111 @@ test('a journaled message rejected during revocation is not deferred until reaut
   await controller.process(update); enabled = true; await controller.process(update);
   assert.equal(f.calls.length, 0); assert.equal(f.store.data.updates['1'].state, 'done');
 });
+
+test('rate-limited approval cards bind their buttons when flushed later', async () => {
+  const f = fixture(); const send = f.telegram.send;
+  let limited = true;
+  f.telegram.send = async (...args) => { if (limited) throw { error_code: 429 }; return send(...args); };
+  await assert.rejects(f.controller.serverRequest(command()), /rate limited/);
+  assert.equal(f.sent.length, 0);
+  limited = false; await f.controller.flush();
+  await f.controller.process(f.callback(1, f.sent[0].extra.reply_markup.inline_keyboard[0][0].callback_data));
+  assert.deepEqual(f.responses, [{ id: 77, result: { decision: 'accept' }, epoch: 1 }]);
+});
+
+test('rate-limited question cards bind option buttons and free-text replies after retry', async () => {
+  for (const freeText of [false, true]) {
+    const f = fixture(); const send = f.telegram.send;
+    f.telegram.send = async () => { throw { error_code: 429 }; };
+    await assert.rejects(f.controller.serverRequest({ id: 99, method: 'item/tool/requestUserInput', params: {
+      threadId: 'alpha', turnId: 'turn', questions: [{ id: 'one', question: 'Pick?', options: [{ label: 'Yes' }] }],
+    } }), /rate limited/);
+    f.telegram.send = send; await f.controller.flush();
+    await f.controller.process(freeText ? f.message(1, 'Custom', { reply_to_message: { message_id: 1 } })
+      : f.callback(1, f.sent[0].extra.reply_markup.inline_keyboard[0][0].callback_data));
+    assert.deepEqual(f.responses[0]?.result, { answers: { one: { answers: [freeText ? 'Custom' : 'Yes'] } } });
+  }
+});
+
+test('a question awaiting retry cannot be answered by replying to its previous card', async () => {
+  const f = fixture(); await f.controller.serverRequest({ id: 99, method: 'item/tool/requestUserInput', params: {
+    threadId: 'alpha', turnId: 'turn', questions: [
+      { id: 'one', question: 'One?', options: [{ label: 'First' }] },
+      { id: 'two', question: 'Two?', options: [{ label: 'Second' }] },
+    ],
+  } });
+  const send = f.telegram.send;
+  f.telegram.send = async () => { throw { error_code: 429 }; };
+  await f.controller.process(f.callback(1, f.sent[0].extra.reply_markup.inline_keyboard[0][0].callback_data));
+  f.telegram.send = send;
+  await f.controller.process(f.message(2, 'Stale answer', { reply_to_message: { message_id: 1 } }));
+  assert.equal(f.responses.length, 0);
+  const card = f.sent.find(m => m.text.includes('Two?'));
+  await f.controller.process(f.callback(3, card.extra.reply_markup.inline_keyboard[0][0].callback_data));
+  assert.deepEqual(f.responses[0]?.result, { answers: { one: { answers: ['First'] }, two: { answers: ['Second'] } } });
+});
+
+test('approval IDs reused after restart produce fresh cards and reject old buttons', async () => {
+  const f = fixture(); await f.controller.serverRequest(command());
+  const oldButton = f.sent[0].extra.reply_markup.inline_keyboard[0][0].callback_data;
+  const recovered = new Store(f.file);
+  const controller = new Controller(recovered, f.codex, f.telegram, []);
+  await controller.serverRequest(command());
+  assert.equal(f.sent.length, 2);
+  const newButton = f.sent[1].extra.reply_markup.inline_keyboard[0][0].callback_data;
+  assert.notEqual(newButton, oldButton);
+  await controller.process(f.callback(1, oldButton)); assert.equal(f.responses.length, 0);
+  await controller.process(f.callback(2, newButton)); assert.equal(f.responses.length, 1);
+});
+
+test('reused approval IDs can cancel only the fresh queued card after restart', async () => {
+  const f = fixture(); await f.controller.serverRequest(command());
+  const oldKey = Object.keys(f.store.data.deliveries).find(k => k.startsWith('request:'));
+  const recovered = new Store(f.file);
+  const controller = new Controller(recovered, f.codex, f.telegram, []);
+  f.telegram.send = async () => { throw { error_code: 429 }; };
+  await assert.rejects(controller.serverRequest(command()), /rate limited/);
+  const freshKey = Object.keys(recovered.data.deliveries).find(k => k.startsWith('request:') && k !== oldKey);
+  assert.ok(freshKey);
+  await controller.notification({ method: 'serverRequest/resolved', params: { threadId: 'alpha', requestId: 77 } });
+  assert.equal(recovered.data.deliveries[freshKey].state, 'cancelled');
+  assert.equal(recovered.data.deliveries[oldKey].state, 'sent');
+});
+
+test('requests resolved during a rate limit never deliver queued controls', async () => {
+  const f = fixture(); const send = f.telegram.send;
+  f.telegram.send = async () => { throw { error_code: 429 }; };
+  await assert.rejects(f.controller.serverRequest(command()), /rate limited/);
+  await f.controller.notification({ method: 'serverRequest/resolved', params: { threadId: 'alpha', requestId: 77 } });
+  f.telegram.send = send; await f.controller.flush();
+  assert.equal(f.sent.length, 0); assert.equal(f.responses.length, 0);
+});
+
+
+test('a multi-part approval binds only after every chunk is delivered', async () => {
+  const f = fixture(); const send = f.telegram.send;
+  f.telegram.send = async (...args) => { if (f.sent.length === 1) throw { error_code: 429 }; return send(...args); };
+  const request = command(); request.params.command = 'x'.repeat(8000);
+  await assert.rejects(f.controller.serverRequest(request), /rate limited/);
+  assert.equal(f.sent.length, 1);
+  f.telegram.send = send; await f.controller.flush();
+  assert.equal(f.sent.length, 3);
+  await f.controller.process(f.callback(1, f.sent[2].extra.reply_markup.inline_keyboard[0][0].callback_data));
+  assert.equal(f.responses.length, 1);
+});
+
+test('a card resolved during an in-flight send is expired on delivery', async () => {
+  const f = fixture(); const send = f.telegram.send;
+  let release, started;
+  const sending = new Promise(resolve => { started = resolve; });
+  f.telegram.send = async (...args) => {
+    started(); await new Promise(resolve => { release = resolve; }); return send(...args);
+  };
+  const delivery = f.controller.serverRequest(command());
+  await sending;
+  await f.controller.notification({ method: 'serverRequest/resolved', params: { threadId: 'alpha', requestId: 77 } });
+  release(); await delivery;
+  assert.equal(f.edited.at(-1).id, 1);
+  await f.controller.process(f.callback(1, f.sent[0].extra.reply_markup.inline_keyboard[0][0].callback_data));
+  assert.equal(f.responses.length, 0);
+});

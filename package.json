@@ -47,7 +47,7 @@
   ],
   "dependencies": {
     "grammy": "^1.42.0",
-    "ws": "^8.18.0"
+    "ws": "^8.23.0"
   },
   "devDependencies": {
     "@types/node": "^20.17.0",
