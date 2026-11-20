@@ -7,11 +7,11 @@ import { Store } from '../dist/store.js';
 import { Controller } from '../dist/controller.js';
 import { RpcError } from '../dist/codex-client.js';
 
-function fixture() {
+function fixture(voice) {
   const file = join(mkdtempSync(join(tmpdir(), 'codex-tg-test-')), 'runtime.json');
   const store = new Store(file);
   Object.assign(store.data, { owner: { userId: '1', chatId: '1' }, selected: 'alpha', watched: ['alpha'], threads: { alpha: { name: 'Alpha', baseline: true } } }); store.save();
-  const calls = [], responses = [], sent = [], edited = [], answers = [];
+  const calls = [], responses = [], sent = [], edited = [], answers = [], inline = [];
   const codex = {
     connected: true, epoch: 1, active: undefined,
     async request(method, params) {
@@ -30,11 +30,12 @@ function fixture() {
     async send(chatId, text, extra) { sent.push({ chatId, text, extra }); return { message_id: sent.length }; },
     async edit(chatId, id, text) { edited.push({ chatId, id, text }); },
     async answer(id, text) { answers.push({ id, text }); },
+    async answerInline(id, draft) { inline.push({ id, draft }); },
   };
-  const controller = new Controller(store, codex, telegram, [{ name: 'Project', cwd: '/allowed/project' }]);
+  const controller = new Controller(store, codex, telegram, [{ name: 'Project', cwd: '/allowed/project' }], undefined, voice);
   const message = (id, text, overrides = {}) => ({ update_id: id, message: { from: { id: 1 }, chat: { id: 1, type: 'private' }, text, ...overrides } });
   const callback = (id, data, overrides = {}) => ({ update_id: id, callback_query: { id: `cb-${id}`, from: { id: 1 }, message: { chat: { id: 1, type: 'private' } }, data, ...overrides } });
-  return { controller, store, codex, telegram, calls, responses, sent, edited, answers, message, callback, file };
+  return { controller, store, codex, telegram, calls, responses, sent, edited, answers, inline, message, callback, file };
 }
 const command = (id = 77, threadId = 'alpha') => ({ id, method: 'item/commandExecution/requestApproval', params: { threadId, turnId: 'turn', itemId: 'command', command: '/usr/bin/printf harmless', cwd: '/original' } });
 
@@ -550,4 +551,147 @@ test('a newly selected thread whose subscription fails is rolled back without ba
   assert.equal(f.store.data.watched.includes('beta'), false);
   await f.controller.retryRecovery(Date.now() + 60000);
   assert.equal(resumes, 1); assert.equal(f.store.data.selected, 'alpha');
+});
+
+
+test('voice preview pins the conversation and leaves controls available during transcription', async () => {
+  const transcript = Promise.withResolvers();
+  const f = fixture({ signal: new AbortController().signal, transcribe: () => transcript.promise, botId: 55 });
+  await f.controller.process(f.message(1, undefined, { message_id: 100, voice: { file_id: 'file', duration: 3 } }));
+  const work = f.controller.serviceVoice();
+  f.codex.active = 'running';
+  await f.controller.process(f.message(2, '/stop'));
+  assert.equal(f.calls.some(call => call.method === 'turn/interrupt'), true);
+  f.store.data.selected = 'beta';
+  transcript.resolve('A transcript');
+  await work;
+  const preview = f.sent.find(message => message.text.includes('A transcript'));
+  assert.match(preview.text, /Alpha/);
+  assert.equal(preview.extra.reply_parameters.message_id, 100);
+  const query = preview.extra.reply_markup.inline_keyboard[0][0].switch_inline_query_current_chat;
+  await f.controller.inlineVoiceQuery({ id: 'outside', from: { id: 2 }, chat_type: 'private', query });
+  await f.controller.inlineVoiceQuery({ id: 'group', from: { id: 1 }, chat_type: 'group', query });
+  await f.controller.inlineVoiceQuery({ id: 'owner', from: { id: 1 }, chat_type: 'sender', query });
+  assert.deepEqual(f.inline, [{ id: 'outside', draft: undefined }, { id: 'group', draft: undefined },
+    { id: 'owner', draft: { id: query.slice(6), label: '[Alpha · alpha]', text: 'A transcript' } }]);
+  assert.equal(f.calls.some(call => ['turn/start', 'turn/steer'].includes(call.method)), false);
+});
+
+test('ready voice drafts survive restart and expire without retaining transcript text', async () => {
+  const voice = { signal: new AbortController().signal, transcribe: async () => 'A transcript', botId: 55 };
+  const f = fixture(voice);
+  await f.controller.process(f.message(1, undefined, { message_id: 100, voice: { file_id: 'file', duration: 3 } }));
+  await f.controller.serviceVoice();
+  const store = new Store(f.file);
+  const restarted = new Controller(store, f.codex, f.telegram, [], undefined, voice);
+  const draft = store.data.updates['1'].voice;
+  const query = { id: 'owner', from: { id: 1 }, chat_type: 'private', query: `voice:${draft.id}` };
+  await restarted.inlineVoiceQuery(query);
+  assert.equal(f.inline.at(-1).draft.text, 'A transcript');
+  draft.expiresAt = 0;
+  await restarted.inlineVoiceQuery(query);
+  assert.equal(f.inline.at(-1).draft, undefined);
+  await restarted.serviceVoice();
+  assert.equal(store.data.updates['1'].state, 'done');
+  assert.equal(readFileSync(f.file, 'utf8').includes('A transcript'), false);
+  assert.match(f.sent.at(-1).text, /expired/);
+});
+
+
+async function voiceFixture(text = 'A transcript') {
+  const voice = { signal: new AbortController().signal, transcribe: async () => text, botId: 55 };
+  const f = fixture(voice);
+  await f.controller.process(f.message(1, undefined, { message_id: 100, voice: { file_id: 'file', duration: 3 } }));
+  await f.controller.serviceVoice();
+  const draft = f.store.data.updates['1'].voice;
+  const marker = `voice-status:${draft.id}`;
+  const posted = (id, overrides = {}) => f.message(id, text, {
+    via_bot: { id: voice.botId }, reply_markup: { inline_keyboard: [[{ text: 'Codex delivery status', callback_data: marker }]] }, ...overrides,
+  });
+  const outcomes = () => f.calls.filter(call => /^turn\/(start|steer)$/.test(call.method));
+  return { ...f, voice, draft, marker, posted, outcomes };
+}
+
+test('only the posted inline result starts a turn in the pinned conversation', async () => {
+  const f = await voiceFixture();
+  f.store.data.selected = 'beta';
+  assert.equal(f.outcomes().length, 0);
+  const fresh = new Store(f.file);
+  const restarted = new Controller(fresh, f.codex, f.telegram, [], undefined, f.voice);
+  await restarted.process(f.posted(2));
+  await restarted.process(f.posted(2));
+  await restarted.process(f.posted(3));
+  assert.deepEqual(f.outcomes(), [{ method: 'turn/start', params: { threadId: 'alpha', input: [{ type: 'text', text: 'A transcript', text_elements: [] }] } }]);
+  assert.equal(fresh.data.updates['1'].state, 'accepted');
+  assert.equal(readFileSync(f.file, 'utf8').includes('A transcript'), false);
+  await restarted.voiceDeliveryStatus({ id: 'outside', from: { id: 2 }, data: f.marker });
+  await restarted.voiceDeliveryStatus({ id: 'owner', from: { id: 1 }, data: f.marker });
+  assert.deepEqual(f.answers, [{ id: 'owner', text: 'Codex accepted the transcript.' }]);
+});
+
+test('a valid inline transcript steers and bypasses Telegram command and question handling', async () => {
+  const f = await voiceFixture('/stop');
+  f.codex.active = 'running';
+  await f.controller.process(f.posted(2, { reply_to_message: { message_id: 123 } }));
+  assert.deepEqual(f.outcomes(), [{ method: 'turn/steer', params: { threadId: 'alpha', expectedTurnId: 'running', input: [{ type: 'text', text: '/stop', text_elements: [] }] } }]);
+  assert.equal(f.calls.some(call => call.method === 'turn/interrupt'), false);
+});
+
+test('wrong owners, chats, bot identities, draft IDs, text and expired results leave Codex untouched', async () => {
+  const f = await voiceFixture();
+  await f.controller.process(f.posted(2, { from: { id: 2 } }));
+  await f.controller.process(f.posted(3, { chat: { id: 2, type: 'private' } }));
+  await f.controller.process(f.posted(4, { via_bot: { id: 56 } }));
+  await f.controller.process(f.posted(5, { reply_markup: undefined }));
+  await f.controller.process(f.posted(6, { text: 'Other text' }));
+  f.draft.expiresAt = 0;
+  await f.controller.process(f.posted(7));
+  assert.equal(f.outcomes().length, 0);
+  assert.equal(f.draft.confirmationId, undefined);
+});
+
+test('a voice dispatch with an uncertain outcome never repeats and redacts the draft', async () => {
+  const f = await voiceFixture();
+  const request = f.codex.request.bind(f.codex);
+  f.codex.request = async (method, params) => {
+    if (method === 'turn/start') { f.calls.push({ method, params }); throw new Error('Connection lost'); }
+    return request(method, params);
+  };
+  await f.controller.process(f.posted(2));
+  const fresh = new Store(f.file);
+  const restarted = new Controller(fresh, f.codex, f.telegram, [], undefined, f.voice);
+  await restarted.process(f.posted(2));
+  await restarted.process(f.posted(3));
+  assert.equal(f.outcomes().length, 1);
+  assert.equal(fresh.data.updates['1'].state, 'uncertain');
+  assert.equal(readFileSync(f.file, 'utf8').includes('A transcript'), false);
+  await restarted.voiceDeliveryStatus({ id: 'owner', from: { id: 1 }, data: f.marker });
+  assert.match(f.answers.at(-1).text, /uncertain/);
+});
+
+test('restart can resume a claimed voice confirmation before any Codex mutation', async () => {
+  const f = await voiceFixture();
+  const post = f.posted(2);
+  f.store.receive([post]);
+  f.store.update(1, { voice: { ...f.draft, confirmationId: 2 } });
+  const fresh = new Store(f.file);
+  const restarted = new Controller(fresh, f.codex, f.telegram, [], undefined, f.voice);
+  await restarted.process(f.posted(3));
+  assert.equal(f.outcomes().length, 0);
+  await restarted.process(post);
+  assert.equal(f.outcomes().length, 1);
+  assert.equal(fresh.data.updates['1'].state, 'accepted');
+});
+
+test('disabling voice on restart clears drafts and queued transcript previews', async () => {
+  const f = await voiceFixture();
+  f.store.data.deliveries[`voice-preview:${f.draft.id}:0`] = { text: 'A transcript', state: 'queued' };
+  f.store.save();
+  const fresh = new Store(f.file);
+  const restarted = new Controller(fresh, f.codex, f.telegram, []);
+  await restarted.serviceVoice();
+  await restarted.process(f.posted(2));
+  assert.equal(f.outcomes().length, 0);
+  assert.equal(fresh.data.updates['1'].state, 'done');
+  assert.equal(readFileSync(f.file, 'utf8').includes('A transcript'), false);
 });

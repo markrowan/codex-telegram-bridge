@@ -1,7 +1,8 @@
 import { openSync, closeSync, fsyncSync, writeFileSync, renameSync, readFileSync, existsSync, mkdirSync, chmodSync } from 'node:fs';
 import { dirname } from 'node:path';
 
-export type Dispatch = { state: 'received' | 'dispatching' | 'accepted' | 'done' | 'uncertain' | 'rejected'; update: any; threadId?: string; turnId?: string; operation?: string; error?: string };
+export type VoiceDraft = { id: string; messageId: number; expiresAt: number; text?: string; confirmationId?: number };
+export type Dispatch = { state: 'received' | 'voice' | 'dispatching' | 'accepted' | 'done' | 'uncertain' | 'rejected'; update: any; threadId?: string; turnId?: string; operation?: string; error?: string; voice?: VoiceDraft };
 export type Delivery = { text: string; state: 'queued' | 'sending' | 'sent' | 'uncertain' | 'cancelled'; messageId?: number; extra?: any };
 export type RuntimeState = {
   version: 1; selected?: string; watched: string[]; owner?: { userId: string; chatId: string };
