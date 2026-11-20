@@ -2,15 +2,19 @@ import { createHash, randomBytes } from 'node:crypto';
 import { basename } from 'node:path';
 import { chunkText } from './common.js';
 import { RpcError, type CodexPort } from './codex-client.js';
-import { Store } from './store.js';
+import { Store, type Dispatch } from './store.js';
+import type { TranscribeVoice } from './voice.js';
 import { markdownChunks } from './markdown.js';
 
 export interface TelegramPort {
   send(chatId: string, text: string, extra?: any): Promise<{ message_id: number }>;
   edit(chatId: string, messageId: number, text: string): Promise<void>;
   answer(callbackId: string, text: string): Promise<void>;
+  answerInline?(id: string, draft?: { id: string; text: string; label: string }): Promise<void>;
 }
 export type Project = { name: string; cwd: string };
+const draftLifetime = 30 * 60_000;
+const pendingVoiceLimit = 8;
 type Route = { epoch: number; run: (updateId: number) => Promise<void> };
 type Prompt = {
   token: string; id: number | string; threadId: string; turnId: string; epoch: number;
@@ -33,7 +37,10 @@ export class Controller {
   private recoveryAgain = new Set<string>();
   private recoveryRetries = new Map<string, { failures: number; after: number; subscription: boolean }>();
 
-  constructor(readonly store: Store, readonly codex: CodexPort, readonly telegram: TelegramPort, readonly projects: Project[], private readonly allowed: () => boolean = () => true) {}
+  private voiceWorker?: Promise<void>;
+
+  constructor(readonly store: Store, readonly codex: CodexPort, readonly telegram: TelegramPort, readonly projects: Project[], private readonly allowed: () => boolean = () => true,
+    private readonly voice?: { transcribe: TranscribeVoice; signal: AbortSignal; botId: number }) {}
   label(id: string): string {
     return `[${this.store.data.threads[id]?.name || 'Codex'} · ${id.slice(0, 8)}]`;
   }
@@ -75,6 +82,14 @@ export class Controller {
       const entry = Object.entries(this.store.data.deliveries).find(([, value]) => value.state === 'queued');
       if (!entry) break;
       const [key, delivery] = entry;
+      if (key.startsWith('voice-preview:')) {
+        const record = this.findVoice(key.split(':')[1]);
+        if (!this.voice || record?.state !== 'voice' || !record.voice || record.voice.confirmationId !== undefined || record.voice.expiresAt <= Date.now()) {
+          this.store.data.deliveries[key] = { text: '', state: 'cancelled' };
+          this.store.save();
+          continue;
+        }
+      }
       const prompt = [...this.prompts.values()].find(p => p.deliveryKeys.includes(key));
       delivery.state = 'sending'; this.store.save();
       try {
@@ -101,6 +116,8 @@ export class Controller {
     return { text, callback_data: `r:${token}` };
   }
   private async mutate(updateId: number, method: string, params: Record<string, any>): Promise<any> {
+    const draft = this.store.data.updates[String(updateId)]?.voice;
+    if (draft) delete draft.text;
     this.store.update(updateId, { state: 'dispatching', operation: method, threadId: params.threadId });
     try {
       const result = await this.codex.request(method, params);
@@ -128,13 +145,153 @@ export class Controller {
     if (!record || record.state !== 'received') return;
     try {
       if (callback) await this.callback(update.update_id, callback);
-      else if (typeof message.text === 'string') await this.text(update.update_id, message);
+      else if (typeof message.text === 'string') {
+        const draftId = this.voiceMessageId(message);
+        if (draftId !== undefined || (this.voice && message.via_bot?.id === this.voice.botId)) {
+          await this.confirmVoice(update.update_id, message, draftId);
+        } else await this.text(update.update_id, message);
+      }
+      else if (message.voice && this.voice) await this.queueVoice(update.update_id, message.message_id);
       else await this.send(`update:${update.update_id}`, 'This version accepts text messages only.');
       if (record.state === 'received') this.store.update(update.update_id, { state: 'done' });
     } catch (error) {
       if (record.state === 'received') this.store.update(update.update_id, { state: 'done', error: (error as Error).message });
       await this.send(`error:${update.update_id}`, `Request was not retried: ${(error as Error).message}`).catch(() => {});
     }
+  }
+  private async queueVoice(updateId: number, messageId: number): Promise<void> {
+    const threadId = this.store.data.selected;
+    if (!threadId) { await this.send(`update:${updateId}`, 'Choose a conversation with /threads or /new before sending a voice note.'); return; }
+    if (Object.values(this.store.data.updates).filter(record => record.state === 'voice').length >= pendingVoiceLimit) {
+      await this.send(`update:${updateId}`, 'Voice drafts are full. Send a transcript or wait for a draft to expire.');
+      return;
+    }
+    this.store.update(updateId, {
+      state: 'voice', threadId, voice: { id: randomBytes(16).toString('hex'), messageId, expiresAt: Date.now() + draftLifetime },
+    });
+  }
+  async serviceVoice(): Promise<void> {
+    if (this.voice?.signal.aborted || this.voiceWorker) return;
+    const work = this.processVoiceDrafts();
+    this.voiceWorker = work;
+    try { await work; } finally { this.voiceWorker = undefined; }
+  }
+  private async processVoiceDrafts(): Promise<void> {
+    const voice = this.voice;
+    for (const [key, record] of Object.entries(this.store.data.updates)) {
+      if (voice?.signal.aborted) return;
+      if (record.state !== 'voice' || !record.voice || !record.threadId) continue;
+      const draft = record.voice;
+      const updateId = Number(key);
+      const expired = draft.expiresAt <= Date.now();
+      const confirmation = draft.confirmationId === undefined ? undefined : this.store.data.updates[String(draft.confirmationId)];
+      const authorized = !!voice && this.allowed();
+      if (authorized && confirmation?.state === 'received') continue;
+      if (!voice || !authorized || expired || draft.confirmationId !== undefined) {
+        this.clearVoicePreview(draft.id);
+        this.store.update(updateId, { state: 'done', voice: { ...draft, text: undefined } });
+        if (authorized && expired && draft.confirmationId === undefined) {
+          await this.send(`voice-expired:${draft.id}`, `${this.label(record.threadId)} Voice draft expired. Send the note again to make a new draft.`);
+        }
+        continue;
+      }
+      const { transcribe, signal } = voice;
+      if (!draft.text) {
+        try {
+          const text = await transcribe(record.update.message.voice, signal);
+          if (signal.aborted) return;
+          if (!this.allowed()) { this.store.update(updateId, { state: 'done', voice: undefined }); return; }
+          if (!text.trim()) throw new Error('No speech was transcribed. Please send another voice note.');
+          if (Array.from(text).length > 4096) throw new Error('The transcript is too long for one Telegram message. Please split the recording.');
+          draft.text = text;
+          draft.expiresAt = Date.now() + draftLifetime;
+          this.store.update(updateId, { update: { update_id: updateId } });
+        } catch (error) {
+          if (signal.aborted) return;
+          this.store.update(updateId, { state: 'done', voice: undefined });
+          await this.send(`voice-error:${draft.id}`, `${this.label(record.threadId)} ${(error as Error).message}`);
+          continue;
+        }
+      }
+      await this.send(`voice-preview:${draft.id}`, `${this.label(record.threadId)}\n${draft.text}`, {
+        reply_parameters: { message_id: draft.messageId, allow_sending_without_reply: true },
+        reply_markup: { inline_keyboard: [[{ text: 'Send transcript', switch_inline_query_current_chat: `voice:${draft.id}` }]] },
+      });
+    }
+  }
+  private clearVoicePreview(id: string): void {
+    for (const [key, delivery] of Object.entries(this.store.data.deliveries)) {
+      if (!key.startsWith(`voice-preview:${id}:`)) continue;
+      if (delivery.state === 'queued') delivery.state = 'cancelled';
+      delivery.text = '';
+      delete delivery.extra;
+    }
+  }
+  private findVoice(id: string): Dispatch | undefined {
+    if (!/^[a-f0-9]{32}$/.test(id)) return;
+    return Object.values(this.store.data.updates).find(record => record.voice?.id === id);
+  }
+  async inlineVoiceQuery(query: { id: string; from: { id: number }; chat_type?: string; query: string }): Promise<void> {
+    if (!this.telegram.answerInline) return;
+    const record = this.voice && this.allowed() && String(query.from.id) === this.owner().userId && (query.chat_type === 'sender' || query.chat_type === 'private') && query.query.startsWith('voice:')
+      ? this.findVoice(query.query.slice('voice:'.length)) : undefined;
+    const draft = record?.voice;
+    if (record?.state !== 'voice' || !record.threadId || !draft?.text || draft.confirmationId !== undefined || draft.expiresAt <= Date.now()) {
+      await this.telegram.answerInline(query.id);
+      return;
+    }
+    await this.telegram.answerInline(query.id, { id: draft.id, text: draft.text, label: this.label(record.threadId) });
+  }
+  private voiceMessageId(message: any): string | undefined {
+    for (const row of message.reply_markup?.inline_keyboard ?? []) {
+      for (const button of row) {
+        if (button.callback_data?.startsWith('voice-status:')) return button.callback_data.slice('voice-status:'.length);
+      }
+    }
+  }
+  private async confirmVoice(confirmationId: number, message: any, id: string | undefined): Promise<void> {
+    const record = id && this.findVoice(id);
+    const key = `update:${confirmationId}`;
+    if (!this.voice || message.via_bot?.id !== this.voice.botId || !record || !record.voice || !record.threadId) {
+      await this.send(key, 'This message could not be matched to a voice draft. No Codex turn was sent.');
+      return;
+    }
+    const draft = record.voice;
+    if (draft.confirmationId !== undefined && (draft.confirmationId !== confirmationId || record.state !== 'voice')) {
+      // Recovery may revisit the same Telegram post after Codex already accepted it.
+      if (draft.confirmationId !== confirmationId) await this.send(key, 'This voice draft was already submitted. Check Codex delivery status on the original transcript.');
+      return;
+    }
+    if (record.state !== 'voice' || (draft.confirmationId === undefined && draft.expiresAt <= Date.now()) || !draft.text || message.text !== draft.text) {
+      await this.send(key, 'This voice draft is expired or does not match the posted text. No Codex turn was sent.');
+      return;
+    }
+    const updateId = record.update.update_id;
+    const threadId = record.threadId;
+    this.clearVoicePreview(draft.id);
+    this.store.update(updateId, { voice: { ...draft, confirmationId } });
+    let active: boolean;
+    try {
+      active = await this.submitText(updateId, threadId, draft.text);
+    } catch (error) {
+      const state = this.store.data.updates[String(updateId)]?.state;
+      if (state === 'voice') this.store.update(updateId, { state: 'rejected', voice: { ...draft, confirmationId, text: undefined }, error: (error as Error).message });
+      const outcome = state === 'uncertain' ? 'Codex delivery is uncertain. Check the conversation before resending.'
+        : 'Codex did not accept this transcript. Send the note again when the conversation is available.';
+      await this.send(key, `${this.label(threadId)} ${outcome}`);
+      return;
+    }
+    await this.send(key, `${this.label(threadId)} ${active ? 'Steering accepted.' : 'Message accepted.'}`);
+  }
+  async voiceDeliveryStatus(callback: { id: string; from: { id: number }; data: string }): Promise<void> {
+    if (!this.allowed() || String(callback.from.id) !== this.owner().userId) return;
+    const record = this.findVoice(callback.data.slice('voice-status:'.length));
+    const status = record?.state === 'accepted' ? 'Codex accepted the transcript.'
+      : record?.state === 'uncertain' ? 'Codex delivery is uncertain. Check the conversation before resending.'
+      : record?.state === 'rejected' ? 'Codex did not accept the transcript.'
+      : record?.state === 'dispatching' || (record?.state === 'voice' && record.voice?.confirmationId !== undefined) ? 'Sending to Codex.'
+      : 'No Codex delivery recorded for this transcript.';
+    await this.telegram.answer(callback.id, status);
   }
   private async text(updateId: number, message: any): Promise<void> {
     const text = message.text.trim();
@@ -169,20 +326,31 @@ export class Controller {
     }
     if (text === '/watch') { await this.watch(selected, false); await this.send(key, `${this.label(selected)} Notifications enabled.`); return; }
     if (text.startsWith('/') && text !== '/stop') { await this.send(key, 'Unknown command. Use /help.'); return; }
-    if (!this.codex.connected || this.reconnecting) throw new Error('Codex is reconnecting; send this message again after /status shows connected');
-    if (!this.store.data.watched.includes(selected)) await this.watch(selected, false);
-    const current = await this.history({ threadId: selected, limit: 1, sortDirection: 'desc', itemsView: 'notLoaded' });
-    const turn = current.data?.[0];
-    const active = turn?.status === 'inProgress' ? turn.id : undefined;
     if (text === '/stop') {
+      const active = await this.activeTurnFor(selected);
       if (!active) { await this.send(key, `${this.label(selected)} There is no active turn.`); return; }
       await this.mutate(updateId, 'turn/interrupt', { threadId: selected, turnId: active });
       await this.send(key, `${this.label(selected)} Interrupt requested.`); return;
     }
-    const input = [{ type: 'text', text, text_elements: [] }];
-    if (active) await this.mutate(updateId, 'turn/steer', { threadId: selected, expectedTurnId: active, input });
-    else await this.mutate(updateId, 'turn/start', { threadId: selected, input });
+    const active = await this.submitText(updateId, selected, text);
     await this.send(key, `${this.label(selected)} ${active ? 'Steering accepted.' : 'Message accepted.'}`);
+  }
+  private async activeTurnFor(threadId: string): Promise<string | undefined> {
+    if (!this.codex.connected || this.reconnecting) throw new Error('Codex is reconnecting; send this message again after /status shows connected');
+    if (!this.store.data.watched.includes(threadId)) await this.watch(threadId, false);
+    const current = await this.history({ threadId, limit: 1, sortDirection: 'desc', itemsView: 'notLoaded' });
+    const turn = current.data?.[0];
+    return turn?.status === 'inProgress' ? turn.id : undefined;
+  }
+  private async submitText(updateId: number, threadId: string, text: string): Promise<boolean> {
+    const active = await this.activeTurnFor(threadId);
+    if (!this.allowed()) throw new Error('Telegram access is no longer authorized');
+    const state = this.store.data.updates[String(updateId)]?.state;
+    if (state !== 'received' && state !== 'voice') throw new Error('This message is no longer awaiting delivery');
+    const input = [{ type: 'text', text, text_elements: [] }];
+    if (active) await this.mutate(updateId, 'turn/steer', { threadId, expectedTurnId: active, input });
+    else await this.mutate(updateId, 'turn/start', { threadId, input });
+    return !!active;
   }
   private async callback(updateId: number, callback: any): Promise<void> {
     const data = String(callback.data ?? '');

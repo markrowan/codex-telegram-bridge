@@ -56,6 +56,18 @@ Watched conversations relay completed user-facing progress, plans, final replies
 
 Assistant replies render Markdown as native Telegram entities: bold, italic, strikethrough, links, inline code and fenced code blocks. Headings use bold text; lists keep their hierarchy, quotes use a visible prefix, and tables use readable text rows. Raw HTML stays literal. Formatting survives long-message splitting, including code whitespace and emoji. Approval action details remain literal so their commands and paths are displayed exactly.
 
+## Voice notes
+
+Voice notes are off by default. To enable them:
+
+1. Install `ffmpeg`, build or install [`whisper-cli`](https://github.com/ggml-org/whisper.cpp), and download a multilingual GGML model such as `ggml-base.bin`.
+2. In **@BotFather**, send `/setinline`, select the bridge bot, and set a placeholder such as `Send a transcript`. The bridge checks that inline mode is enabled when voice support starts.
+3. In the bridge's local `.env`, set `CODEX_TELEGRAM_WHISPER_MODEL` to the absolute model path. If the executables are outside the service's `PATH`, set `CODEX_TELEGRAM_WHISPER_CLI` and `CODEX_TELEGRAM_FFMPEG` to their absolute paths. Restart the bridge service to load the settings.
+
+Select a conversation and send a voice note in the bot's private chat. The bridge runs transcription locally and replies with a preview and the destination conversation. Tap **Send transcript**, then select the result in Telegram's picker. Telegram posts it under your name with a “via bot” label. That post starts or steers a turn in the conversation selected when you sent the note. The preview alone leaves Codex untouched.
+
+Notes are limited to two minutes and 10 MiB. Transcription has a two-minute deadline, and drafts expire after 30 minutes. Audio is processed in a private temporary directory and removed after processing. A Telegram personal login and a transcription API key are unnecessary. To disable voice handling, remove `CODEX_TELEGRAM_WHISPER_MODEL` and restart the bridge service.
+
 ## Approvals and questions
 
 Command and file requests offer one-action decisions. Explicit permission grants apply to the displayed requested permissions for the current turn only. There is no session-grant or policy-amendment control. Read the displayed request before approving it.
@@ -88,4 +100,4 @@ If a connection is lost after Telegram or Codex may have accepted an operation, 
 
 Complete a real paired Telegram round trip, multi-thread selection, watched ChatGPT replies, `/new`, steering, stop, questions, approvals answered in both clients, long replies, unauthorized access rejection and restart recovery. Automated tests use mocks and isolated local WebSocket fixtures; they do not require Telegram credentials.
 
-Attachments, voice, remote configuration changes and model changes are outside this fork's first version.
+General attachments, remote configuration changes and model changes are outside this fork's scope.
