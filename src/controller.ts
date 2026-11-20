@@ -10,6 +10,7 @@ export interface TelegramPort {
   send(chatId: string, text: string, extra?: any): Promise<{ message_id: number }>;
   edit(chatId: string, messageId: number, text: string): Promise<void>;
   answer(callbackId: string, text: string): Promise<void>;
+  typing?(chatId: string): Promise<void>;
   answerInline?(id: string, draft?: { id: string; text: string; label: string }): Promise<void>;
 }
 export type Project = { name: string; cwd: string };
@@ -38,6 +39,11 @@ export class Controller {
   private recoveryRetries = new Map<string, { failures: number; after: number; subscription: boolean }>();
 
   private voiceWorker?: Promise<void>;
+  private typingTurns = new Map<string, string>();
+  private completedTurns = new Map<string, string>();
+  private typingWaits = new Map<string, Map<string, string>>();
+  private typingTimer?: NodeJS.Timeout;
+  private typingInFlight = false;
 
   constructor(readonly store: Store, readonly codex: CodexPort, readonly telegram: TelegramPort, readonly projects: Project[], private readonly allowed: () => boolean = () => true,
     private readonly voice?: { transcribe: TranscribeVoice; signal: AbortSignal; botId: number }) {}
@@ -270,18 +276,15 @@ export class Controller {
     const threadId = record.threadId;
     this.clearVoicePreview(draft.id);
     this.store.update(updateId, { voice: { ...draft, confirmationId } });
-    let active: boolean;
     try {
-      active = await this.submitText(updateId, threadId, draft.text);
+      await this.submitText(updateId, threadId, draft.text);
     } catch (error) {
       const state = this.store.data.updates[String(updateId)]?.state;
       if (state === 'voice') this.store.update(updateId, { state: 'rejected', voice: { ...draft, confirmationId, text: undefined }, error: (error as Error).message });
       const outcome = state === 'uncertain' ? 'Codex delivery is uncertain. Check the conversation before resending.'
         : 'Codex did not accept this transcript. Send the note again when the conversation is available.';
       await this.send(key, `${this.label(threadId)} ${outcome}`);
-      return;
     }
-    await this.send(key, `${this.label(threadId)} ${active ? 'Steering accepted.' : 'Message accepted.'}`);
   }
   async voiceDeliveryStatus(callback: { id: string; from: { id: number }; data: string }): Promise<void> {
     if (!this.allowed() || String(callback.from.id) !== this.owner().userId) return;
@@ -321,6 +324,10 @@ export class Controller {
     if (!selected) { await this.send(key, 'Choose a conversation with /threads or create one with /new first.'); return; }
     if (text === '/unwatch') {
       this.store.data.watched = this.store.data.watched.filter(id => id !== selected); this.store.save();
+      this.typingTurns.delete(selected);
+      this.completedTurns.delete(selected);
+      this.typingWaits.delete(selected);
+      this.syncTyping();
       await this.invalidate(p => p.threadId === selected, 'Thread is no longer watched');
       await this.send(key, `${this.label(selected)} Notifications stopped. Selection is unchanged.`); return;
     }
@@ -332,8 +339,7 @@ export class Controller {
       await this.mutate(updateId, 'turn/interrupt', { threadId: selected, turnId: active });
       await this.send(key, `${this.label(selected)} Interrupt requested.`); return;
     }
-    const active = await this.submitText(updateId, selected, text);
-    await this.send(key, `${this.label(selected)} ${active ? 'Steering accepted.' : 'Message accepted.'}`);
+    await this.submitText(updateId, selected, text);
   }
   private async activeTurnFor(threadId: string): Promise<string | undefined> {
     if (!this.codex.connected || this.reconnecting) throw new Error('Codex is reconnecting; send this message again after /status shows connected');
@@ -342,15 +348,47 @@ export class Controller {
     const turn = current.data?.[0];
     return turn?.status === 'inProgress' ? turn.id : undefined;
   }
-  private async submitText(updateId: number, threadId: string, text: string): Promise<boolean> {
+  private async submitText(updateId: number, threadId: string, text: string): Promise<void> {
     const active = await this.activeTurnFor(threadId);
     if (!this.allowed()) throw new Error('Telegram access is no longer authorized');
     const state = this.store.data.updates[String(updateId)]?.state;
     if (state !== 'received' && state !== 'voice') throw new Error('This message is no longer awaiting delivery');
     const input = [{ type: 'text', text, text_elements: [] }];
-    if (active) await this.mutate(updateId, 'turn/steer', { threadId, expectedTurnId: active, input });
-    else await this.mutate(updateId, 'turn/start', { threadId, input });
-    return !!active;
+    const epoch = this.codex.epoch;
+    const result = active
+      ? await this.mutate(updateId, 'turn/steer', { threadId, expectedTurnId: active, input })
+      : await this.mutate(updateId, 'turn/start', { threadId, input });
+    const turnId = active ?? result.turn?.id ?? result.turnId;
+    const alreadyFinished = this.completedTurns.get(threadId) === turnId
+      || (!active && result.turn?.status && result.turn.status !== 'inProgress');
+    if (turnId && !alreadyFinished && this.codex.connected && epoch === this.codex.epoch) {
+      this.typingTurns.set(threadId, turnId);
+      this.syncTyping();
+    }
+  }
+  private syncTyping(refresh = false): void {
+    const owner = this.store.data.owner;
+    const eligible = !!this.telegram.typing && !!owner && this.codex.connected && this.allowed()
+      && [...this.typingTurns].some(([threadId, turnId]) => this.store.data.watched.includes(threadId)
+        && ![...(this.typingWaits.get(threadId)?.values() ?? [])].includes(turnId));
+    if (!eligible) {
+      clearInterval(this.typingTimer);
+      this.typingTimer = undefined;
+      return;
+    }
+    if (this.typingTimer && !refresh) return;
+    if (!this.typingTimer) {
+      this.typingTimer = setInterval(() => this.syncTyping(true), 4000);
+      this.typingTimer.unref();
+    }
+    void this.sendTyping(owner.chatId);
+  }
+  private async sendTyping(chatId: string): Promise<void> {
+    if (this.typingInFlight) return;
+    this.typingInFlight = true;
+    try { await this.telegram.typing?.(chatId); }
+    catch { /* Typing status is best effort. */ }
+    finally { this.typingInFlight = false; }
   }
   private async callback(updateId: number, callback: any): Promise<void> {
     const data = String(callback.data ?? '');
@@ -518,6 +556,11 @@ export class Controller {
   async notification(message: any): Promise<void> {
     const p = message.params ?? {};
     if (message.method === 'serverRequest/resolved') {
+      const waits = this.typingWaits.get(p.threadId);
+      if (waits?.delete(String(p.requestId))) {
+        if (!waits.size) this.typingWaits.delete(p.threadId);
+        this.syncTyping();
+      }
       await this.invalidate(r => r.threadId === p.threadId && String(r.id) === String(p.requestId), 'Resolved in Codex'); return;
     }
     if (!this.store.data.watched.includes(p.threadId)) return;
@@ -528,8 +571,22 @@ export class Controller {
     if (message.method === 'item/completed') await this.relayItem(p.threadId, p.item);
     if (message.method === 'turn/started') {
       this.store.data.threads[p.threadId].activeTurn = p.turn?.id; this.store.save();
+      const typingTurn = this.typingTurns.get(p.threadId);
+      if (typingTurn && typingTurn !== p.turn?.id) {
+        this.typingTurns.delete(p.threadId);
+        this.syncTyping();
+      }
     }
     if (message.method === 'turn/completed') {
+      const turnId = p.turn?.id;
+      if (turnId) this.completedTurns.set(p.threadId, turnId);
+      if (this.typingTurns.get(p.threadId) === turnId) this.typingTurns.delete(p.threadId);
+      const waits = this.typingWaits.get(p.threadId);
+      if (waits) {
+        for (const [id, waitingTurn] of waits) if (waitingTurn === turnId) waits.delete(id);
+        if (!waits.size) this.typingWaits.delete(p.threadId);
+      }
+      this.syncTyping();
       this.store.data.threads[p.threadId].activeTurn = undefined; this.store.save();
       await this.invalidate(r => r.threadId === p.threadId && r.turnId === p.turn?.id, 'Turn ended');
       try { await this.relayOutcome(p.threadId, p.turn); }
@@ -538,6 +595,10 @@ export class Controller {
     }
   }
   async disconnected(): Promise<void> {
+    this.typingTurns.clear();
+    this.completedTurns.clear();
+    this.typingWaits.clear();
+    this.syncTyping();
     this.routes.clear();
     for (const entry of Object.values(this.store.data.updates)) if (entry.state === 'dispatching') entry.state = 'uncertain';
     this.store.save(); await this.invalidate(() => true, 'Connection closed; continue in ChatGPT or wait for a fresh request');
@@ -549,6 +610,10 @@ export class Controller {
     const params = request.params ?? {};
     if (!this.allowed() || !this.store.data.watched.includes(params.threadId) || !this.store.data.owner || !params.turnId) return;
     if ([...this.prompts.values()].some(p => p.id === request.id && p.epoch === this.codex.epoch)) return;
+    const waits = this.typingWaits.get(params.threadId) ?? new Map<string, string>();
+    waits.set(String(request.id), params.turnId);
+    this.typingWaits.set(params.threadId, waits);
+    this.syncTyping();
     const supported = ['item/commandExecution/requestApproval', 'item/fileChange/requestApproval', 'item/permissions/requestApproval', 'item/tool/requestUserInput'];
     if (!supported.includes(request.method)) {
       await this.send(`unsupported:${this.codex.epoch}:${request.id}`, `${this.label(params.threadId)} A request requires ChatGPT: ${request.method}`); return;

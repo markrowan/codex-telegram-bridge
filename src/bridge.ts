@@ -34,6 +34,10 @@ const telegram: TelegramPort = {
   send: (chatId, text, extra) => bot.api.sendMessage(chatId, text, { link_preview_options: { is_disabled: true }, ...extra }),
   edit: async (chatId, messageId, text) => { await bot.api.editMessageText(chatId, messageId, text, { reply_markup: { inline_keyboard: [] } }); },
   answer: async (id, text) => { await bot.api.answerCallbackQuery(id, { text }); },
+  typing: async chatId => {
+    const signal = AbortSignal.any([abort.signal, AbortSignal.timeout(3000)]);
+    await bot.api.sendChatAction(chatId, 'typing', {}, signal as unknown as NonNullable<Parameters<typeof bot.api.sendChatAction>[3]>);
+  },
   answerInline: async (id, draft) => {
     await bot.api.answerInlineQuery(id, draft ? [{
       type: 'article', id: draft.id, title: `Send transcript to ${draft.label}`,
