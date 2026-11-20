@@ -50,7 +50,7 @@ codex-tg service enable
 | `/status` | Show selection, watched threads, connection and uncertain delivery counts. |
 | `/help` | Show the controls. |
 
-Ordinary text starts a turn when idle or steers an active turn immediately. A race is reported without silently starting or queueing another turn. Observed activity never changes your selected message target.
+Ordinary text starts a turn when idle or steers an active turn immediately. After Codex accepts a message or transcript, Telegram shows the bot typing while the turn runs and pauses the indicator when action is needed. A race is reported without silently starting or queueing another turn. Observed activity never changes your selected message target.
 
 Watched conversations relay completed user-facing progress, plans, final replies and failures, even when work starts in ChatGPT. Messages include the thread label; raw tool output is excluded. Newly watched threads do not dump old history. Reconnection uses the stored history cursor to recover missed replies.
 

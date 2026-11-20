@@ -54,6 +54,7 @@ test('a normal message starts an idle turn with inherited settings', async () =>
   const f = fixture(); await f.controller.process(f.message(1, 'Hello'));
   assert.deepEqual(f.calls.find(c => c.method === 'turn/start').params, { threadId: 'alpha', input: [{ type: 'text', text: 'Hello', text_elements: [] }] });
   assert.equal(f.store.data.updates['1'].state, 'accepted');
+  assert.equal(f.sent.length, 0);
 });
 test('active follow-ups steer once, with expected turn id', async () => {
   const f = fixture(); f.codex.active = 'running';
@@ -62,6 +63,7 @@ test('active follow-ups steer once, with expected turn id', async () => {
   assert.equal(f.calls.find(c => c.method === 'turn/steer').params.expectedTurnId, 'running');
   await f.controller.process(f.message(1, 'Adjust direction'));
   assert.equal(f.calls.filter(c => c.method === 'turn/steer').length, 1);
+  assert.equal(f.sent.length, 0);
 });
 test('a raced steering rejection never falls back to a new turn', async () => {
   const f = fixture(); f.codex.active = 'running';
@@ -694,4 +696,76 @@ test('disabling voice on restart clears drafts and queued transcript previews', 
   assert.equal(f.outcomes().length, 0);
   assert.equal(fresh.data.updates['1'].state, 'done');
   assert.equal(readFileSync(f.file, 'utf8').includes('A transcript'), false);
+});
+
+
+test('typing replaces acceptance messages and refreshes until the tracked turn completes', async t => {
+  t.mock.timers.enable({ apis: ['setInterval'] });
+  const f = fixture();
+  const typing = [];
+  f.telegram.typing = async chatId => { typing.push(chatId); };
+  await f.controller.process(f.message(1, 'Hello'));
+  assert.deepEqual(typing, ['1']);
+  f.codex.active = 'started';
+  await f.controller.process(f.message(2, 'Follow-up'));
+  assert.deepEqual(typing, ['1']);
+  assert.equal(f.sent.length, 0);
+  t.mock.timers.tick(4000);
+  assert.deepEqual(typing, ['1', '1']);
+  f.codex.active = undefined;
+  await f.controller.notification({ method: 'turn/completed', params: { threadId: 'alpha', turn: { id: 'started', status: 'completed' } } });
+  t.mock.timers.tick(8000);
+  assert.deepEqual(typing, ['1', '1']);
+});
+
+test('typing pauses on approval, resumes on resolution, and clears on disconnect', async t => {
+  t.mock.timers.enable({ apis: ['setInterval'] });
+  const f = fixture();
+  let calls = 0;
+  f.telegram.typing = async () => { calls++; };
+  await f.controller.process(f.message(1, 'Start'));
+  const request = command();
+  request.params.turnId = 'started';
+  await f.controller.serverRequest(request);
+  assert.match(f.sent.at(-1).text, /Requested details/);
+  t.mock.timers.tick(8000);
+  assert.equal(calls, 1);
+  await f.controller.notification({ method: 'serverRequest/resolved', params: { threadId: 'alpha', requestId: String(request.id) } });
+  assert.equal(calls, 2);
+  f.codex.connected = false;
+  await f.controller.disconnected();
+  t.mock.timers.tick(8000);
+  assert.equal(calls, 2);
+});
+
+test('a completion before the start response does not leave a typing indicator running', async t => {
+  t.mock.timers.enable({ apis: ['setInterval'] });
+  const f = fixture();
+  let calls = 0;
+  f.telegram.typing = async () => { calls++; };
+  const request = f.codex.request.bind(f.codex);
+  f.codex.request = async (method, params) => {
+    if (method === 'turn/start') {
+      await f.controller.notification({ method: 'turn/completed', params: { threadId: 'alpha', turn: { id: 'started', status: 'completed' } } });
+    }
+    return request(method, params);
+  };
+  await f.controller.process(f.message(1, 'Quick answer'));
+  t.mock.timers.tick(8000);
+  assert.equal(calls, 0);
+  assert.equal(f.store.data.updates['1'].state, 'accepted');
+});
+
+test('a confirmed voice transcript uses typing and Telegram action failures do not affect delivery', async t => {
+  t.mock.timers.enable({ apis: ['setInterval'] });
+  const f = await voiceFixture();
+  let calls = 0;
+  f.telegram.typing = async () => { calls++; throw new Error('Telegram action unavailable'); };
+  const messages = f.sent.length;
+  await f.controller.process(f.posted(2));
+  assert.equal(calls, 1);
+  assert.equal(f.sent.length, messages);
+  assert.equal(f.store.data.updates['1'].state, 'accepted');
+  t.mock.timers.tick(4000);
+  assert.equal(calls, 2);
 });
