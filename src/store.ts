@@ -2,7 +2,7 @@ import { openSync, closeSync, fsyncSync, writeFileSync, renameSync, readFileSync
 import { dirname } from 'node:path';
 import type { VoiceFailure } from './voice.js';
 
-export type VoiceDraft = { id: string; messageId: number; expiresAt: number; text?: string; confirmationId?: number };
+export type VoiceDraft = { id: string; messageId: number; expiresAt: number; text?: string; revision?: number; confirmationId?: number };
 export type Dispatch = { state: 'received' | 'voice' | 'dispatching' | 'accepted' | 'done' | 'uncertain' | 'rejected'; update: any; threadId?: string; turnId?: string; operation?: string; error?: string; voice?: VoiceDraft; voiceFailure?: VoiceFailure };
 export type Delivery = { text: string; state: 'queued' | 'sending' | 'sent' | 'uncertain' | 'cancelled'; messageId?: number; extra?: any };
 export type RuntimeState = {

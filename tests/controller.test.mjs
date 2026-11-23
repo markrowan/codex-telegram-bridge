@@ -792,17 +792,22 @@ test('a Telegram quote routes to its recorded Codex conversation after restart',
   assert.deepEqual(reactions, [['1', 41]]);
 });
 
-test('editing a voice preview steers once, reacts to the edited post and consumes the inline option', async () => {
+test('editing a voice preview stages text, and only the current inline result steers and gets a reaction', async () => {
   const f = await voiceFixture();
   f.store.data.selected = 'beta';
   f.codex.active = 'running';
   const reactions = [];
   f.telegram.react = async (chat, id) => { reactions.push([chat, id]); throw new Error('Emoji unavailable'); };
   await f.controller.process(f.message(2, 'Edited words', { message_id: 501, reply_to_message: { message_id: 1 } }));
+  assert.equal(f.outcomes().length, 0);
   await f.controller.process(f.posted(3, { message_id: 502 }));
+  assert.match(f.sent.at(-1).text, /expired or changed/);
+  assert.equal(f.outcomes().length, 0);
+  await f.controller.process(f.posted(4, { message_id: 503, text: 'Edited words' }));
+  await f.controller.process(f.posted(5, { message_id: 504, text: 'Edited words' }));
   assert.deepEqual(f.outcomes(), [{ method: 'turn/steer', params: { threadId: 'alpha', expectedTurnId: 'running', input: [{ type: 'text', text: 'Edited words', text_elements: [] }] } }]);
   assert.equal(f.store.data.updates['1'].state, 'accepted');
-  assert.deepEqual(reactions, [['1', 501]]);
+  assert.deepEqual(reactions, [['1', 503]]);
   assert.match(f.sent.at(-1).text, /already submitted/);
 });
 
@@ -834,33 +839,22 @@ test('a slow voice progress message becomes the actionable preview without anoth
   assert.equal(f.sent.length, 1);
   assert.match(f.edited[0].text, /Transcript ending marker/);
   await f.controller.process(f.message(2, 'Edited transcript', { message_id: 101, reply_to_message: { message_id: f.edited[0].id } }));
-  assert.equal(f.calls.find(call => call.method === 'turn/start').params.input[0].text, 'Edited transcript');
+  assert.equal(f.calls.some(call => call.method === 'turn/start'), false);
+  assert.match(f.edited.at(-1).text, /Edited transcript/);
 });
 
 
-test('the native edit link loads the transcript and its marker binds only one submission', async () => {
-  const input = 'Original transcript';
-  const voice = { signal: new AbortController().signal, transcribe: async () => input, botId: 55, botUsername: 'the_bridge_bot' };
-  const f = fixture(voice);
-  await f.controller.process(f.message(1, undefined, { message_id: 100, voice: { file_id: 'file', duration: 30 } }));
-  await f.controller.serviceVoice();
-  const buttons = f.sent[0].extra.reply_markup.inline_keyboard[0];
-  const url = new URL(buttons.find(button => button.text === 'Edit transcript').url);
-  assert.equal(url.protocol, 'tg:');
-  assert.equal(url.searchParams.get('text'), input);
-  const marker = url.searchParams.get('url');
-  const draft = f.store.data.updates['1'].voice;
-  assert.equal(marker, `https://t.me/the_bridge_bot?start=voice_${draft.id}`);
-  f.store.data.selected = 'beta';
-  await f.controller.process(f.message(2, `${marker}\nCorrected transcript`, { message_id: 501 }));
-  await f.controller.process(f.message(3, input, { message_id: 502, via_bot: { id: voice.botId }, reply_markup: {
-    inline_keyboard: [[{ callback_data: `voice-status:${draft.id}` }]],
-  } }));
-  assert.deepEqual(f.calls.filter(call => call.method === 'turn/start'), [{ method: 'turn/start', params: {
-    threadId: 'alpha', input: [{ type: 'text', text: 'Corrected transcript', text_elements: [] }],
-  } }]);
-  assert.match(f.sent.at(-1).text, /already submitted/);
-  await f.controller.process(f.message(4, `${marker.replace(draft.id, 'a'.repeat(32))}\nUnknown draft`));
-  assert.match(f.sent.at(-1).text, /could not be matched/);
-  assert.equal(f.calls.filter(call => call.method === 'turn/start').length, 1);
+test('a phrase correction edits the draft and never submits by itself', async () => {
+  const f = await voiceFixture('Meet on Mon day at noon.');
+  await f.controller.process(f.message(2, 'Mon day → Monday', { message_id: 501, reply_to_message: { message_id: 1 } }));
+  assert.equal(f.outcomes().length, 0);
+  assert.match(f.edited.at(-1).text, /Meet on Monday at noon/);
+  await f.controller.process(f.message(3, 'Unknown phrase → Tuesday', { reply_to_message: { message_id: 1 } }));
+  assert.match(f.sent.at(-1).text, /exactly once/);
+  const fresh = new Store(f.file);
+  const controller = new Controller(fresh, f.codex, f.telegram, [], undefined, f.voice);
+  await controller.inlineVoiceQuery({ id: 'owner', from: { id: 1 }, chat_type: 'sender', query: `voice:${f.draft.id}` });
+  assert.equal(f.inline.at(-1).draft.text, 'Meet on Monday at noon.');
+  await controller.process(f.posted(4, { text: 'Meet on Monday at noon.' }));
+  assert.equal(f.outcomes().length, 1);
 });
