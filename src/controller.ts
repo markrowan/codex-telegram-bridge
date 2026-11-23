@@ -47,7 +47,7 @@ export class Controller {
   private typingInFlight = false;
 
   constructor(readonly store: Store, readonly codex: CodexPort, readonly telegram: TelegramPort, readonly projects: Project[], private readonly allowed: () => boolean = () => true,
-    private readonly voice?: { transcribe: TranscribeVoice; signal: AbortSignal; botId: number }) {}
+    private readonly voice?: { transcribe: TranscribeVoice; signal: AbortSignal; botId: number; botUsername?: string }) {}
   label(id: string): string {
     return `[${this.store.data.threads[id]?.name || 'Codex'} · ${id.slice(0, 8)}]`;
   }
@@ -159,7 +159,7 @@ export class Controller {
       else if (typeof message.text === 'string') {
         const draftId = this.voiceMessageId(message);
         if (draftId !== undefined || (this.voice && message.via_bot?.id === this.voice.botId)) {
-          await this.confirmVoice(update.update_id, message,
+          await this.confirmVoice(update.update_id, message.message_id, message.text,
             message.via_bot?.id === this.voice?.botId && draftId ? this.findVoice(draftId) : undefined, 'inline');
         } else await this.text(update.update_id, message);
       }
@@ -236,8 +236,14 @@ export class Controller {
         } finally { clearTimeout(timer); }
         await progress;
       }
-      const body = `${this.label(record.threadId)} Reply with edited text to submit corrections.\n${draft.text}`;
-      const replyMarkup = { inline_keyboard: [[{ text: 'Send as-is', switch_inline_query_current_chat: `voice:${draft.id}` }]] };
+      const link = this.voiceEditLink(draft.id, draft.text);
+      const instructions = link ? 'To edit, choose this bot in Telegram’s picker and keep the first line.'
+        : 'To edit, copy the transcript and reply here.';
+      const body = `${this.label(record.threadId)} ${instructions}\n${draft.text}`;
+      const replyMarkup = { inline_keyboard: [[
+        { text: 'Send as-is', switch_inline_query_current_chat: `voice:${draft.id}` },
+        ...(link ? [{ text: 'Edit transcript', url: link }] : []),
+      ]] };
       const previewKey = `voice-preview:${draft.id}`;
       if (!this.store.data.deliveries[`${previewKey}:0`]) {
         if (body.length <= 3775) {
@@ -253,6 +259,15 @@ export class Controller {
         reply_parameters: { message_id: draft.messageId, allow_sending_without_reply: true }, reply_markup: replyMarkup,
       });
     }
+  }
+  private voiceEditLink(id: string, text: string): string | undefined {
+    const username = this.voice?.botUsername;
+    if (!username) return;
+    const url = `https://t.me/${username}?start=voice_${id}`;
+    if (Array.from(`${url}\n${text}`).length > 4096) return;
+    const link = `tg://msg_url?${new URLSearchParams({ url, text })}`;
+    // Keep markup bounded on clients that limit long Telegram deep links.
+    if (link.length <= 4096) return link;
   }
   private async editVoiceProgress(id: string, text: string, replyMarkup?: any): Promise<number | undefined> {
     const delivery = this.store.data.deliveries[`voice-progress:${id}:0`];
@@ -296,7 +311,7 @@ export class Controller {
       }
     }
   }
-  private async confirmVoice(confirmationId: number, message: any, record: Dispatch | undefined, source: 'inline' | 'reply'): Promise<void> {
+  private async confirmVoice(confirmationId: number, messageId: number, text: string, record: Dispatch | undefined, source: 'inline' | 'edit'): Promise<void> {
     const key = `update:${confirmationId}`;
     if (!this.voice || !record?.voice || !record.threadId) {
       await this.send(key, 'This message could not be matched to a voice draft. No Codex turn was sent.');
@@ -308,7 +323,6 @@ export class Controller {
       if (draft.confirmationId !== confirmationId) await this.send(key, 'This voice draft was already submitted. Check Codex delivery status on the original transcript.');
       return;
     }
-    const text = source === 'inline' ? message.text : message.text.trim();
     if (record.state !== 'voice' || (draft.confirmationId === undefined && draft.expiresAt <= Date.now())
       || !draft.text || !text || (source === 'inline' && text !== draft.text)) {
       await this.send(key, 'This voice draft is expired or does not match the posted text. No Codex turn was sent.');
@@ -319,7 +333,7 @@ export class Controller {
     this.clearVoicePreview(draft.id);
     this.store.update(updateId, { voice: { ...draft, confirmationId } });
     try {
-      await this.submitText(updateId, threadId, text, message.message_id);
+      await this.submitText(updateId, threadId, text, messageId);
     } catch (error) {
       const state = this.store.data.updates[String(updateId)]?.state;
       if (state === 'voice') this.store.update(updateId, { state: 'rejected', voice: { ...draft, confirmationId, text: undefined }, error: (error as Error).message });
@@ -341,6 +355,12 @@ export class Controller {
   private async text(updateId: number, message: any): Promise<void> {
     const text = message.text.trim();
     const key = `update:${updateId}`;
+    const shared = /^https:\/\/t\.me\/([a-zA-Z0-9_]+)\?start=voice_([a-f0-9]{32})[ \t]*(?:\r?\n([\s\S]*)|$)/.exec(text);
+    if (shared) {
+      const draft = shared[1].toLowerCase() === this.voice?.botUsername?.toLowerCase() ? this.findVoice(shared[2]) : undefined;
+      await this.confirmVoice(updateId, message.message_id, shared[3]?.trim() ?? '', draft, 'edit');
+      return;
+    }
     if (message.reply_to_message?.message_id) {
       const prompt = [...this.prompts.values()].find(p => p.active && p.messages.includes(message.reply_to_message.message_id));
       if (prompt?.method === 'item/tool/requestUserInput') { await this.answerQuestion(prompt, text, updateId); return; }
@@ -349,7 +369,7 @@ export class Controller {
         && (deliveryKey.startsWith('item:') || deliveryKey.startsWith('voice-preview:')));
       const targetKey = target?.[0];
       if (targetKey?.startsWith('voice-preview:')) {
-        await this.confirmVoice(updateId, message, this.findVoice(targetKey.split(':')[1]), 'reply');
+        await this.confirmVoice(updateId, message.message_id, text, this.findVoice(targetKey.split(':')[1]), 'edit');
         return;
       }
       const threadId = targetKey && Object.keys(this.store.data.threads).find(id => targetKey.startsWith(`item:${id}:`));

@@ -836,3 +836,31 @@ test('a slow voice progress message becomes the actionable preview without anoth
   await f.controller.process(f.message(2, 'Edited transcript', { message_id: 101, reply_to_message: { message_id: f.edited[0].id } }));
   assert.equal(f.calls.find(call => call.method === 'turn/start').params.input[0].text, 'Edited transcript');
 });
+
+
+test('the native edit link loads the transcript and its marker binds only one submission', async () => {
+  const input = 'Original transcript';
+  const voice = { signal: new AbortController().signal, transcribe: async () => input, botId: 55, botUsername: 'the_bridge_bot' };
+  const f = fixture(voice);
+  await f.controller.process(f.message(1, undefined, { message_id: 100, voice: { file_id: 'file', duration: 30 } }));
+  await f.controller.serviceVoice();
+  const buttons = f.sent[0].extra.reply_markup.inline_keyboard[0];
+  const url = new URL(buttons.find(button => button.text === 'Edit transcript').url);
+  assert.equal(url.protocol, 'tg:');
+  assert.equal(url.searchParams.get('text'), input);
+  const marker = url.searchParams.get('url');
+  const draft = f.store.data.updates['1'].voice;
+  assert.equal(marker, `https://t.me/the_bridge_bot?start=voice_${draft.id}`);
+  f.store.data.selected = 'beta';
+  await f.controller.process(f.message(2, `${marker}\nCorrected transcript`, { message_id: 501 }));
+  await f.controller.process(f.message(3, input, { message_id: 502, via_bot: { id: voice.botId }, reply_markup: {
+    inline_keyboard: [[{ callback_data: `voice-status:${draft.id}` }]],
+  } }));
+  assert.deepEqual(f.calls.filter(call => call.method === 'turn/start'), [{ method: 'turn/start', params: {
+    threadId: 'alpha', input: [{ type: 'text', text: 'Corrected transcript', text_elements: [] }],
+  } }]);
+  assert.match(f.sent.at(-1).text, /already submitted/);
+  await f.controller.process(f.message(4, `${marker.replace(draft.id, 'a'.repeat(32))}\nUnknown draft`));
+  assert.match(f.sent.at(-1).text, /could not be matched/);
+  assert.equal(f.calls.filter(call => call.method === 'turn/start').length, 1);
+});

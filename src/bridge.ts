@@ -76,7 +76,7 @@ const transcribe = voiceModel ? localTranscriber(
     return fetch(`https://api.telegram.org/file/bot${token}/${path}`, { signal, redirect: 'error' });
   },
 ) : undefined;
-const voice = transcribe ? { transcribe, signal: abort.signal, botId: 0 } : undefined;
+const voice = transcribe ? { transcribe, signal: abort.signal, botId: 0, botUsername: '' } : undefined;
 const controller = new Controller(store, codex, telegram, projects, allowed, voice);
 let stopping = false;
 // grammy still declares the legacy abort-controller signal type; its fetch path accepts native signals.
@@ -170,6 +170,7 @@ try {
     const identity = await bot.api.getMe();
     if (!identity.supports_inline_queries) throw new Error('Enable inline mode with BotFather /setinline to use voice notes.');
     voice.botId = identity.id;
+    voice.botUsername = identity.username;
   }
   console.error('[bridge] Direct daemon mode; private pairing required; no daemon lifecycle control.');
   await Promise.all([connectLoop(), pollLoop()]);
