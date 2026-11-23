@@ -243,7 +243,7 @@ export class Controller {
     }
   }
   private async publishVoicePreview(threadId: string, draft: VoiceDraft): Promise<void> {
-    const body = `${this.label(threadId)} To correct a phrase, reply: wrong words -> corrected words.\n${draft.text}`;
+    const body = `${this.label(threadId)} Quote the words to correct, then reply with the replacement.\n${draft.text}`;
     const replyMarkup = { inline_keyboard: [[{ text: 'Send transcript', switch_inline_query_current_chat: `voice:${draft.id}` }]] };
     const prefix = `voice-preview:${draft.id}`;
     const key = draft.revision === undefined ? prefix : `${prefix}:revision-${draft.revision}`;
@@ -338,7 +338,7 @@ export class Controller {
       await this.send(key, `${this.label(threadId)} ${outcome}`);
     }
   }
-  private async reviseVoice(updateId: number, text: string, record: Dispatch | undefined): Promise<void> {
+  private async reviseVoice(updateId: number, message: any, text: string, record: Dispatch | undefined): Promise<void> {
     const key = `update:${updateId}`;
     const draft = record?.voice;
     if (!this.voice || record?.state !== 'voice' || !record.threadId || !draft?.text
@@ -351,16 +351,21 @@ export class Controller {
       return;
     }
     let revised = text;
-    const arrow = /->|→/.exec(text);
-    if (arrow) {
-      const before = text.slice(0, arrow.index).trim();
-      const after = text.slice(arrow.index + arrow[0].length).trim();
-      const position = draft.text.indexOf(before);
-      if (!before || position < 0 || draft.text.indexOf(before, position + 1) >= 0) {
-        await this.send(key, 'Quote a phrase that appears exactly once in the transcript, then add -> and the replacement.');
+    const quote = message.quote;
+    if (quote?.is_manual && typeof quote.text === 'string' && quote.text) {
+      const preview = message.reply_to_message?.text;
+      const bodyStart = typeof preview === 'string' ? preview.indexOf('\n') + 1 : 0;
+      const offset = quote.position - bodyStart;
+      const matchesPosition = bodyStart > 0 && preview.slice(bodyStart) === draft.text && offset >= 0
+        && draft.text.slice(offset, offset + quote.text.length) === quote.text;
+      const first = draft.text.indexOf(quote.text);
+      const appearsOnce = first >= 0 && draft.text.indexOf(quote.text, first + 1) < 0;
+      if ((bodyStart > 0 && offset < 0) || (!matchesPosition && !appearsOnce)) {
+        await this.send(key, 'Select a unique passage in the latest transcript preview and quote it again.');
         return;
       }
-      revised = draft.text.slice(0, position) + after + draft.text.slice(position + before.length);
+      const position = matchesPosition ? offset : first;
+      revised = draft.text.slice(0, position) + text + draft.text.slice(position + quote.text.length);
     }
     if (!revised.trim() || Array.from(revised).length > 4096) {
       await this.send(key, 'The corrected transcript must fit in one Telegram message.');
@@ -391,7 +396,7 @@ export class Controller {
         && (deliveryKey.startsWith('item:') || deliveryKey.startsWith('voice-preview:')));
       const targetKey = target?.[0];
       if (targetKey?.startsWith('voice-preview:')) {
-        await this.reviseVoice(updateId, text, this.findVoice(targetKey.split(':')[1]));
+        await this.reviseVoice(updateId, message, text, this.findVoice(targetKey.split(':')[1]));
         return;
       }
       const threadId = targetKey && Object.keys(this.store.data.threads).find(id => targetKey.startsWith(`item:${id}:`));

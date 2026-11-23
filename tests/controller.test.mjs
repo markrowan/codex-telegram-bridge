@@ -844,17 +844,23 @@ test('a slow voice progress message becomes the actionable preview without anoth
 });
 
 
-test('a phrase correction edits the draft and never submits by itself', async () => {
-  const f = await voiceFixture('Meet on Mon day at noon.');
-  await f.controller.process(f.message(2, 'Mon day -> Monday', { message_id: 501, reply_to_message: { message_id: 1 } }));
+test('a selected quote edits only that occurrence and never submits by itself', async () => {
+  const f = await voiceFixture('Monday morning. Monday afternoon.');
+  const preview = f.sent[0].text;
+  await f.controller.process(f.message(2, 'Tuesday', {
+    message_id: 501, reply_to_message: { message_id: 1, text: preview },
+    quote: { is_manual: true, text: 'Monday', position: preview.lastIndexOf('Monday') },
+  }));
   assert.equal(f.outcomes().length, 0);
-  assert.match(f.edited.at(-1).text, /Meet on Monday at noon/);
-  await f.controller.process(f.message(3, 'Unknown phrase → Tuesday', { reply_to_message: { message_id: 1 } }));
-  assert.match(f.sent.at(-1).text, /exactly once/);
+  assert.match(f.edited.at(-1).text, /Monday morning. Tuesday afternoon/);
+  await f.controller.process(f.message(3, 'Wednesday', {
+    reply_to_message: { message_id: 1 }, quote: { is_manual: true, text: 'Unknown phrase', position: 25 },
+  }));
+  assert.match(f.sent.at(-1).text, /unique passage/);
   const fresh = new Store(f.file);
   const controller = new Controller(fresh, f.codex, f.telegram, [], undefined, f.voice);
   await controller.inlineVoiceQuery({ id: 'owner', from: { id: 1 }, chat_type: 'sender', query: `voice:${f.draft.id}` });
-  assert.equal(f.inline.at(-1).draft.text, 'Meet on Monday at noon.');
-  await controller.process(f.posted(4, { text: 'Meet on Monday at noon.' }));
+  assert.equal(f.inline.at(-1).draft.text, 'Monday morning. Tuesday afternoon.');
+  await controller.process(f.posted(4, { text: 'Monday morning. Tuesday afternoon.' }));
   assert.equal(f.outcomes().length, 1);
 });
