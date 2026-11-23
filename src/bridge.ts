@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-import { Bot } from 'grammy';
+import { Bot, GrammyError } from 'grammy';
 import { homedir } from 'node:os';
 import { isAbsolute, join } from 'node:path';
 import { existsSync, realpathSync, statSync } from 'node:fs';
@@ -32,7 +32,20 @@ for (const project of projects) {
 if (!projects.length) throw new Error('Configure at least one project with local setup.');
 const telegram: TelegramPort = {
   send: (chatId, text, extra) => bot.api.sendMessage(chatId, text, { link_preview_options: { is_disabled: true }, ...extra }),
-  edit: async (chatId, messageId, text) => { await bot.api.editMessageText(chatId, messageId, text, { reply_markup: { inline_keyboard: [] } }); },
+  edit: async (chatId, messageId, text, extra) => {
+    try {
+      await bot.api.editMessageText(chatId, messageId, text, {
+        link_preview_options: { is_disabled: true }, reply_markup: { inline_keyboard: [] }, ...extra,
+      });
+    } catch (error) {
+      if (!(error instanceof GrammyError && error.error_code === 400 && error.description.includes('message is not modified'))) throw error;
+    }
+  },
+  react: async (chatId, messageId) => {
+    const signal = AbortSignal.any([abort.signal, AbortSignal.timeout(3000)]);
+    await bot.api.setMessageReaction(chatId, messageId, [{ type: 'emoji', emoji: '👀' }], {},
+      signal as unknown as NonNullable<Parameters<typeof bot.api.setMessageReaction>[4]>);
+  },
   answer: async (id, text) => { await bot.api.answerCallbackQuery(id, { text }); },
   typing: async chatId => {
     const signal = AbortSignal.any([abort.signal, AbortSignal.timeout(3000)]);

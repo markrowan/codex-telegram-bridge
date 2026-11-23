@@ -50,3 +50,10 @@ fs.writeFileSync(args[args.indexOf('-of') + 1] + '.txt', fs.readFileSync(audio))
   await assert.rejects(transcribe(note, signal), /No speech/);
   await assert.rejects(readFile(join(await readFile(pathRecord, 'utf8'), 'note.ogg')), { code: 'ENOENT' });
 });
+
+test('voice failures identify the failed phase without exposing provider or process errors', async () => {
+  const failedDownload = localTranscriber('/model', 'unused', 'unused', async () => { throw new Error('private provider details'); });
+  await assert.rejects(failedDownload(note, signal), { stage: 'download', message: 'Downloading the voice note failed. Please try again.' });
+  const failedConvert = localTranscriber('/model', 'unused', '/does-not-exist', async () => new Response('audio'));
+  await assert.rejects(failedConvert(note, signal), { stage: 'conversion', message: 'Converting the voice note failed. Please try again.' });
+});
