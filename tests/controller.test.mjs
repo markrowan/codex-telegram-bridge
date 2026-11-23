@@ -846,7 +846,7 @@ test('a slow voice progress message becomes the actionable preview without anoth
 
 test('a phrase correction edits the draft and never submits by itself', async () => {
   const f = await voiceFixture('Meet on Mon day at noon.');
-  await f.controller.process(f.message(2, 'Mon day → Monday', { message_id: 501, reply_to_message: { message_id: 1 } }));
+  await f.controller.process(f.message(2, 'Mon day -> Monday', { message_id: 501, reply_to_message: { message_id: 1 } }));
   assert.equal(f.outcomes().length, 0);
   assert.match(f.edited.at(-1).text, /Meet on Monday at noon/);
   await f.controller.process(f.message(3, 'Unknown phrase → Tuesday', { reply_to_message: { message_id: 1 } }));

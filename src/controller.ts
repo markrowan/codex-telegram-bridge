@@ -243,7 +243,7 @@ export class Controller {
     }
   }
   private async publishVoicePreview(threadId: string, draft: VoiceDraft): Promise<void> {
-    const body = `${this.label(threadId)} To correct a phrase, reply: wrong words → corrected words.\n${draft.text}`;
+    const body = `${this.label(threadId)} To correct a phrase, reply: wrong words -> corrected words.\n${draft.text}`;
     const replyMarkup = { inline_keyboard: [[{ text: 'Send transcript', switch_inline_query_current_chat: `voice:${draft.id}` }]] };
     const prefix = `voice-preview:${draft.id}`;
     const key = draft.revision === undefined ? prefix : `${prefix}:revision-${draft.revision}`;
@@ -351,13 +351,13 @@ export class Controller {
       return;
     }
     let revised = text;
-    const separator = text.indexOf('→');
-    if (separator >= 0) {
-      const before = text.slice(0, separator).trim();
-      const after = text.slice(separator + 1).trim();
+    const arrow = /->|→/.exec(text);
+    if (arrow) {
+      const before = text.slice(0, arrow.index).trim();
+      const after = text.slice(arrow.index + arrow[0].length).trim();
       const position = draft.text.indexOf(before);
       if (!before || position < 0 || draft.text.indexOf(before, position + 1) >= 0) {
-        await this.send(key, 'Quote a phrase that appears exactly once in the transcript, then add → and the replacement.');
+        await this.send(key, 'Quote a phrase that appears exactly once in the transcript, then add -> and the replacement.');
         return;
       }
       revised = draft.text.slice(0, position) + after + draft.text.slice(position + before.length);
