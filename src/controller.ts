@@ -2,13 +2,14 @@ import { createHash, randomBytes } from 'node:crypto';
 import { basename } from 'node:path';
 import { chunkText } from './common.js';
 import { RpcError, type CodexPort } from './codex-client.js';
-import { Store, type Dispatch } from './store.js';
-import type { TranscribeVoice } from './voice.js';
+import { Store, type Dispatch, type VoiceDraft } from './store.js';
+import { VoiceError, type TranscribeVoice } from './voice.js';
 import { markdownChunks } from './markdown.js';
 
 export interface TelegramPort {
   send(chatId: string, text: string, extra?: any): Promise<{ message_id: number }>;
-  edit(chatId: string, messageId: number, text: string): Promise<void>;
+  edit(chatId: string, messageId: number, text: string, extra?: any): Promise<void>;
+  react?(chatId: string, messageId: number): Promise<void>;
   answer(callbackId: string, text: string): Promise<void>;
   typing?(chatId: string): Promise<void>;
   answerInline?(id: string, draft?: { id: string; text: string; label: string }): Promise<void>;
@@ -88,9 +89,10 @@ export class Controller {
       const entry = Object.entries(this.store.data.deliveries).find(([, value]) => value.state === 'queued');
       if (!entry) break;
       const [key, delivery] = entry;
-      if (key.startsWith('voice-preview:')) {
+      if (key.startsWith('voice-preview:') || key.startsWith('voice-progress:')) {
         const record = this.findVoice(key.split(':')[1]);
-        if (!this.voice || record?.state !== 'voice' || !record.voice || record.voice.confirmationId !== undefined || record.voice.expiresAt <= Date.now()) {
+        if (!this.voice || record?.state !== 'voice' || !record.voice || record.voice.confirmationId !== undefined || record.voice.expiresAt <= Date.now()
+          || (key.startsWith('voice-progress:') && !!record.voice.text)) {
           this.store.data.deliveries[key] = { text: '', state: 'cancelled' };
           this.store.save();
           continue;
@@ -110,7 +112,10 @@ export class Controller {
         }
       } catch (error: any) {
         // Telegram explicitly rejected 429 requests, so retrying these is safe.
-        delivery.state = error?.error_code === 429 ? 'queued' : 'uncertain'; this.store.save();
+        delivery.state = error?.error_code === 429 ? 'queued' : 'uncertain';
+        const draft = key.startsWith('voice-preview:') ? this.findVoice(key.split(':')[1]) : undefined;
+        if (draft) draft.voiceFailure = 'preview';
+        this.store.save();
         throw new Error(error?.error_code === 429 ? 'Telegram rate limited delivery; it remains queued' : 'Telegram delivery is uncertain; it will not be resent automatically');
       }
     }
@@ -154,7 +159,8 @@ export class Controller {
       else if (typeof message.text === 'string') {
         const draftId = this.voiceMessageId(message);
         if (draftId !== undefined || (this.voice && message.via_bot?.id === this.voice.botId)) {
-          await this.confirmVoice(update.update_id, message, draftId);
+          await this.confirmVoice(update.update_id, message.message_id, message.text,
+            message.via_bot?.id === this.voice?.botId && draftId ? this.findVoice(draftId) : undefined);
         } else await this.text(update.update_id, message);
       }
       else if (message.voice && this.voice) await this.queueVoice(update.update_id, message.message_id);
@@ -203,26 +209,72 @@ export class Controller {
       }
       const { transcribe, signal } = voice;
       if (!draft.text) {
+        let progress: Promise<unknown> | undefined;
+        const timer = setTimeout(() => {
+          progress = this.send(`voice-progress:${draft.id}`, `${this.label(record.threadId!)} Transcribing…`, {
+            reply_parameters: { message_id: draft.messageId, allow_sending_without_reply: true },
+          }).catch(() => {});
+        }, 3000);
+        timer.unref();
         try {
           const text = await transcribe(record.update.message.voice, signal);
           if (signal.aborted) return;
           if (!this.allowed()) { this.store.update(updateId, { state: 'done', voice: undefined }); return; }
-          if (!text.trim()) throw new Error('No speech was transcribed. Please send another voice note.');
-          if (Array.from(text).length > 4096) throw new Error('The transcript is too long for one Telegram message. Please split the recording.');
+          if (!text.trim()) throw new VoiceError('whisper', 'No speech was transcribed. Please send another voice note.');
+          if (Array.from(text).length > 4096) throw new VoiceError('validation', 'The transcript is too long for one Telegram message. Please split the recording.');
           draft.text = text;
           draft.expiresAt = Date.now() + draftLifetime;
           this.store.update(updateId, { update: { update_id: updateId } });
         } catch (error) {
           if (signal.aborted) return;
-          this.store.update(updateId, { state: 'done', voice: undefined });
-          await this.send(`voice-error:${draft.id}`, `${this.label(record.threadId)} ${(error as Error).message}`);
+          const failure = error instanceof VoiceError ? error : new VoiceError('whisper', 'Voice transcription failed. Please try again.');
+          this.store.update(updateId, { state: 'done', voice: undefined, voiceFailure: failure.stage });
+          await progress;
+          const notice = `${this.label(record.threadId)} ${failure.message}`;
+          const progressId = this.store.data.deliveries[`voice-progress:${draft.id}:0`]?.messageId;
+          if (progressId === undefined || !await this.editVoiceMessage(draft.id, progressId, notice)) {
+            await this.send(`voice-error:${draft.id}`, notice);
+          }
           continue;
-        }
+        } finally { clearTimeout(timer); }
+        await progress;
       }
-      await this.send(`voice-preview:${draft.id}`, `${this.label(record.threadId)}\n${draft.text}`, {
-        reply_parameters: { message_id: draft.messageId, allow_sending_without_reply: true },
-        reply_markup: { inline_keyboard: [[{ text: 'Send transcript', switch_inline_query_current_chat: `voice:${draft.id}` }]] },
-      });
+      await this.publishVoicePreview(record.threadId, draft);
+    }
+  }
+  private async publishVoicePreview(threadId: string, draft: VoiceDraft): Promise<void> {
+    const body = `${this.label(threadId)} Quote the words to correct, then reply with the replacement.\n${draft.text}`;
+    const replyMarkup = { inline_keyboard: [[{ text: 'Send transcript', switch_inline_query_current_chat: `voice:${draft.id}` }]] };
+    const prefix = `voice-preview:${draft.id}`;
+    const key = draft.revision === undefined ? prefix : `${prefix}:revision-${draft.revision}`;
+    if (!this.store.data.deliveries[`${key}:0`]) {
+      const earlier = new Set(Object.entries(this.store.data.deliveries)
+        .filter(([id, value]) => id.startsWith(`${prefix}:`) && value.state === 'sent')
+        .map(([, value]) => value.messageId));
+      const progress = this.store.data.deliveries[`voice-progress:${draft.id}:0`]?.messageId;
+      const target = draft.revision === undefined ? progress : earlier.size === 1 ? [...earlier][0] : undefined;
+      if (body.length <= 3775 && target !== undefined && await this.editVoiceMessage(draft.id, target, body, replyMarkup)) {
+        this.store.data.deliveries[`${key}:0`] = { text: '', state: 'sent', messageId: target };
+        this.store.save();
+        return;
+      }
+      if (body.length > 3775 && draft.revision === undefined && progress !== undefined) {
+        await this.editVoiceMessage(draft.id, progress, `${this.label(threadId)} Transcript ready below.`);
+      }
+    }
+    await this.send(key, body, {
+      reply_parameters: { message_id: draft.messageId, allow_sending_without_reply: true }, reply_markup: replyMarkup,
+    });
+  }
+  private async editVoiceMessage(id: string, messageId: number, text: string, replyMarkup?: any): Promise<boolean> {
+    if (!this.allowed()) return false;
+    try {
+      await this.telegram.edit(this.owner().chatId, messageId, text, replyMarkup ? { reply_markup: replyMarkup } : undefined);
+      return true;
+    } catch {
+      const record = this.findVoice(id);
+      if (record) { record.voiceFailure = 'preview'; this.store.save(); }
+      return false;
     }
   }
   private clearVoicePreview(id: string): void {
@@ -255,10 +307,9 @@ export class Controller {
       }
     }
   }
-  private async confirmVoice(confirmationId: number, message: any, id: string | undefined): Promise<void> {
-    const record = id && this.findVoice(id);
+  private async confirmVoice(confirmationId: number, messageId: number, text: string, record: Dispatch | undefined): Promise<void> {
     const key = `update:${confirmationId}`;
-    if (!this.voice || message.via_bot?.id !== this.voice.botId || !record || !record.voice || !record.threadId) {
+    if (!this.voice || !record?.voice || !record.threadId) {
       await this.send(key, 'This message could not be matched to a voice draft. No Codex turn was sent.');
       return;
     }
@@ -268,8 +319,9 @@ export class Controller {
       if (draft.confirmationId !== confirmationId) await this.send(key, 'This voice draft was already submitted. Check Codex delivery status on the original transcript.');
       return;
     }
-    if (record.state !== 'voice' || (draft.confirmationId === undefined && draft.expiresAt <= Date.now()) || !draft.text || message.text !== draft.text) {
-      await this.send(key, 'This voice draft is expired or does not match the posted text. No Codex turn was sent.');
+    if (record.state !== 'voice' || (draft.confirmationId === undefined && draft.expiresAt <= Date.now())
+      || !draft.text || text !== draft.text) {
+      await this.send(key, 'This voice draft expired or changed. Use Send transcript on the latest preview.');
       return;
     }
     const updateId = record.update.update_id;
@@ -277,7 +329,7 @@ export class Controller {
     this.clearVoicePreview(draft.id);
     this.store.update(updateId, { voice: { ...draft, confirmationId } });
     try {
-      await this.submitText(updateId, threadId, draft.text);
+      await this.submitText(updateId, threadId, text, messageId);
     } catch (error) {
       const state = this.store.data.updates[String(updateId)]?.state;
       if (state === 'voice') this.store.update(updateId, { state: 'rejected', voice: { ...draft, confirmationId, text: undefined }, error: (error as Error).message });
@@ -285,6 +337,43 @@ export class Controller {
         : 'Codex did not accept this transcript. Send the note again when the conversation is available.';
       await this.send(key, `${this.label(threadId)} ${outcome}`);
     }
+  }
+  private async reviseVoice(updateId: number, message: any, text: string, record: Dispatch | undefined): Promise<void> {
+    const key = `update:${updateId}`;
+    const draft = record?.voice;
+    if (!this.voice || record?.state !== 'voice' || !record.threadId || !draft?.text
+      || draft.confirmationId !== undefined || draft.expiresAt <= Date.now()) {
+      await this.send(key, 'This voice draft is no longer open for corrections.');
+      return;
+    }
+    if (draft.revision === updateId) {
+      await this.publishVoicePreview(record.threadId, draft);
+      return;
+    }
+    let revised = text;
+    const quote = message.quote;
+    if (quote?.is_manual && typeof quote.text === 'string' && quote.text) {
+      const preview = message.reply_to_message?.text;
+      const bodyStart = typeof preview === 'string' ? preview.indexOf('\n') + 1 : 0;
+      const offset = quote.position - bodyStart;
+      const matchesPosition = bodyStart > 0 && preview.slice(bodyStart) === draft.text && offset >= 0
+        && draft.text.slice(offset, offset + quote.text.length) === quote.text;
+      const first = draft.text.indexOf(quote.text);
+      const appearsOnce = first >= 0 && draft.text.indexOf(quote.text, first + 1) < 0;
+      if ((bodyStart > 0 && offset < 0) || (!matchesPosition && !appearsOnce)) {
+        await this.send(key, 'Select a unique passage in the latest transcript preview and quote it again.');
+        return;
+      }
+      const position = matchesPosition ? offset : first;
+      revised = draft.text.slice(0, position) + text + draft.text.slice(position + quote.text.length);
+    }
+    if (!revised.trim() || Array.from(revised).length > 4096) {
+      await this.send(key, 'The corrected transcript must fit in one Telegram message.');
+      return;
+    }
+    const revision = { ...draft, text: revised, revision: updateId };
+    this.store.update(record.update.update_id, { voice: revision });
+    await this.publishVoicePreview(record.threadId, revision);
   }
   async voiceDeliveryStatus(callback: { id: string; from: { id: number }; data: string }): Promise<void> {
     if (!this.allowed() || String(callback.from.id) !== this.owner().userId) return;
@@ -302,7 +391,24 @@ export class Controller {
     if (message.reply_to_message?.message_id) {
       const prompt = [...this.prompts.values()].find(p => p.active && p.messages.includes(message.reply_to_message.message_id));
       if (prompt?.method === 'item/tool/requestUserInput') { await this.answerQuestion(prompt, text, updateId); return; }
-      await this.send(key, 'That message has no live question attached. Send ordinary text without replying to address the selected conversation.'); return;
+      const target = Object.entries(this.store.data.deliveries).find(([deliveryKey, delivery]) =>
+        delivery.state === 'sent' && delivery.messageId === message.reply_to_message.message_id
+        && (deliveryKey.startsWith('item:') || deliveryKey.startsWith('voice-preview:')));
+      const targetKey = target?.[0];
+      if (targetKey?.startsWith('voice-preview:')) {
+        await this.reviseVoice(updateId, message, text, this.findVoice(targetKey.split(':')[1]));
+        return;
+      }
+      const threadId = targetKey && Object.keys(this.store.data.threads).find(id => targetKey.startsWith(`item:${id}:`));
+      if (!threadId || !text) {
+        await this.send(key, 'This reply could not be matched to a Codex message or live draft. Send ordinary text to the selected conversation instead.');
+        return;
+      }
+      const quote = message.quote?.text || message.reply_to_message.text;
+      const input = typeof quote === 'string' && quote.trim()
+        ? `${text}\n\nTelegram reply context (quoted from the earlier Codex message):\n${quote}` : text;
+      await this.submitText(updateId, threadId, input, message.message_id);
+      return;
     }
     if (text === '/start' || text === '/help') {
       await this.send(key, 'Choose /threads, then send text. While Codex works, text steers its active turn.\n/threads — choose an existing thread\n/watch — watch the selected thread\n/unwatch — stop its notifications\n/new — choose a project for a new thread\n/status — connection, selection and delivery state\n/stop — interrupt the selected active turn\n/help — these commands\nReply to a question card to enter a free-text answer. Approvals apply only to the displayed action.'); return;
@@ -339,7 +445,7 @@ export class Controller {
       await this.mutate(updateId, 'turn/interrupt', { threadId: selected, turnId: active });
       await this.send(key, `${this.label(selected)} Interrupt requested.`); return;
     }
-    await this.submitText(updateId, selected, text);
+    await this.submitText(updateId, selected, text, message.message_id);
   }
   private async activeTurnFor(threadId: string): Promise<string | undefined> {
     if (!this.codex.connected || this.reconnecting) throw new Error('Codex is reconnecting; send this message again after /status shows connected');
@@ -348,7 +454,7 @@ export class Controller {
     const turn = current.data?.[0];
     return turn?.status === 'inProgress' ? turn.id : undefined;
   }
-  private async submitText(updateId: number, threadId: string, text: string): Promise<void> {
+  private async submitText(updateId: number, threadId: string, text: string, messageId?: number): Promise<void> {
     const active = await this.activeTurnFor(threadId);
     if (!this.allowed()) throw new Error('Telegram access is no longer authorized');
     const state = this.store.data.updates[String(updateId)]?.state;
@@ -358,6 +464,7 @@ export class Controller {
     const result = active
       ? await this.mutate(updateId, 'turn/steer', { threadId, expectedTurnId: active, input })
       : await this.mutate(updateId, 'turn/start', { threadId, input });
+    if (typeof messageId === 'number' && Number.isSafeInteger(messageId)) void this.reactToAcceptedMessage(messageId);
     const turnId = active ?? result.turn?.id ?? result.turnId;
     const alreadyFinished = this.completedTurns.get(threadId) === turnId
       || (!active && result.turn?.status && result.turn.status !== 'inProgress');
@@ -365,6 +472,11 @@ export class Controller {
       this.typingTurns.set(threadId, turnId);
       this.syncTyping();
     }
+  }
+  private async reactToAcceptedMessage(messageId: number): Promise<void> {
+    if (!this.telegram.react || !this.allowed()) return;
+    try { await this.telegram.react(this.owner().chatId, messageId); }
+    catch { /* Codex has already accepted the message. */ }
   }
   private syncTyping(refresh = false): void {
     const owner = this.store.data.owner;

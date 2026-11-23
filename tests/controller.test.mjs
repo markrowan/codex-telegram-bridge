@@ -769,3 +769,98 @@ test('a confirmed voice transcript uses typing and Telegram action failures do n
   t.mock.timers.tick(4000);
   assert.equal(calls, 2);
 });
+
+
+test('a Telegram quote routes to its recorded Codex conversation after restart', async () => {
+  const f = fixture();
+  await f.controller.notification({ method: 'item/completed', params: { threadId: 'alpha', item: { id: 'answer', type: 'agentMessage', text: 'First part. Mentioned clause.' } } });
+  const fresh = new Store(f.file);
+  fresh.data.selected = 'beta';
+  const controller = new Controller(fresh, f.codex, f.telegram, []);
+  const reactions = [];
+  f.telegram.react = async (chatId, messageId) => { reactions.push([chatId, messageId]); };
+  await controller.process(f.message(1, 'Explain this', { message_id: 41, reply_to_message: { message_id: 1, text: f.sent[0].text }, quote: { text: 'Mentioned clause.' } }));
+  const start = f.calls.find(call => call.method === 'turn/start');
+  assert.equal(start.params.threadId, 'alpha');
+  assert.match(start.params.input[0].text, /^Explain this\n[\s\S]*Mentioned clause\.$/);
+  assert.doesNotMatch(start.params.input[0].text, /First part/);
+  assert.equal(fresh.data.selected, 'beta');
+  assert.deepEqual(reactions, [['1', 41]]);
+  await controller.process(f.message(2, 'Unknown reply', { message_id: 42, reply_to_message: { message_id: 999, text: 'Other' } }));
+  assert.match(f.sent.at(-1).text, /could not be matched/);
+  assert.equal(f.calls.filter(call => call.method === 'turn/start').length, 1);
+  assert.deepEqual(reactions, [['1', 41]]);
+});
+
+test('editing a voice preview stages text, and only the current inline result steers and gets a reaction', async () => {
+  const f = await voiceFixture();
+  f.store.data.selected = 'beta';
+  f.codex.active = 'running';
+  const reactions = [];
+  f.telegram.react = async (chat, id) => { reactions.push([chat, id]); throw new Error('Emoji unavailable'); };
+  await f.controller.process(f.message(2, 'Edited words', { message_id: 501, reply_to_message: { message_id: 1 } }));
+  assert.equal(f.outcomes().length, 0);
+  await f.controller.process(f.posted(3, { message_id: 502 }));
+  assert.match(f.sent.at(-1).text, /expired or changed/);
+  assert.equal(f.outcomes().length, 0);
+  await f.controller.process(f.posted(4, { message_id: 503, text: 'Edited words' }));
+  await f.controller.process(f.posted(5, { message_id: 504, text: 'Edited words' }));
+  assert.deepEqual(f.outcomes(), [{ method: 'turn/steer', params: { threadId: 'alpha', expectedTurnId: 'running', input: [{ type: 'text', text: 'Edited words', text_elements: [] }] } }]);
+  assert.equal(f.store.data.updates['1'].state, 'accepted');
+  assert.deepEqual(reactions, [['1', 503]]);
+  assert.match(f.sent.at(-1).text, /already submitted/);
+});
+
+test('an expired voice preview reply and a rejected steer receive no acceptance reaction', async () => {
+  const f = await voiceFixture();
+  const reactions = [];
+  f.telegram.react = async (_, id) => { reactions.push(id); };
+  f.draft.expiresAt = 0;
+  await f.controller.process(f.message(2, 'Edited too late', { message_id: 501, reply_to_message: { message_id: 1 } }));
+  assert.equal(f.outcomes().length, 0);
+  f.codex.active = 'running';
+  const request = f.codex.request.bind(f.codex);
+  f.codex.request = (method, params) => method === 'turn/steer' ? Promise.reject(new RpcError('steer rejected', -32600)) : request(method, params);
+  await f.controller.process(f.message(3, 'Steer', { message_id: 502 }));
+  assert.deepEqual(reactions, []);
+  assert.equal(f.store.data.updates['3'].state, 'rejected');
+});
+
+test('a slow voice progress message becomes the actionable preview without another post', async t => {
+  t.mock.timers.enable({ apis: ['setTimeout'] });
+  const pending = Promise.withResolvers();
+  const f = fixture({ signal: new AbortController().signal, transcribe: () => pending.promise, botId: 55 });
+  await f.controller.process(f.message(1, undefined, { message_id: 100, voice: { file_id: 'file', duration: 120 } }));
+  const work = f.controller.serviceVoice();
+  t.mock.timers.tick(3000);
+  assert.match(f.sent[0].text, /Transcribing/);
+  pending.resolve('Transcript ending marker');
+  await work;
+  assert.equal(f.sent.length, 1);
+  assert.match(f.edited[0].text, /Transcript ending marker/);
+  await f.controller.process(f.message(2, 'Edited transcript', { message_id: 101, reply_to_message: { message_id: f.edited[0].id } }));
+  assert.equal(f.calls.some(call => call.method === 'turn/start'), false);
+  assert.match(f.edited.at(-1).text, /Edited transcript/);
+});
+
+
+test('a selected quote edits only that occurrence and never submits by itself', async () => {
+  const f = await voiceFixture('Monday morning. Monday afternoon.');
+  const preview = f.sent[0].text;
+  await f.controller.process(f.message(2, 'Tuesday', {
+    message_id: 501, reply_to_message: { message_id: 1, text: preview },
+    quote: { is_manual: true, text: 'Monday', position: preview.lastIndexOf('Monday') },
+  }));
+  assert.equal(f.outcomes().length, 0);
+  assert.match(f.edited.at(-1).text, /Monday morning. Tuesday afternoon/);
+  await f.controller.process(f.message(3, 'Wednesday', {
+    reply_to_message: { message_id: 1 }, quote: { is_manual: true, text: 'Unknown phrase', position: 25 },
+  }));
+  assert.match(f.sent.at(-1).text, /unique passage/);
+  const fresh = new Store(f.file);
+  const controller = new Controller(fresh, f.codex, f.telegram, [], undefined, f.voice);
+  await controller.inlineVoiceQuery({ id: 'owner', from: { id: 1 }, chat_type: 'sender', query: `voice:${f.draft.id}` });
+  assert.equal(f.inline.at(-1).draft.text, 'Monday morning. Tuesday afternoon.');
+  await controller.process(f.posted(4, { text: 'Monday morning. Tuesday afternoon.' }));
+  assert.equal(f.outcomes().length, 1);
+});

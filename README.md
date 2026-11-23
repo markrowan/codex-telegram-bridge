@@ -50,7 +50,7 @@ codex-tg service enable
 | `/status` | Show selection, watched threads, connection and uncertain delivery counts. |
 | `/help` | Show the controls. |
 
-Ordinary text starts a turn when idle or steers an active turn immediately. After Codex accepts a message or transcript, Telegram shows the bot typing while the turn runs and pauses the indicator when action is needed. A race is reported without silently starting or queueing another turn. Observed activity never changes your selected message target.
+Ordinary text starts a turn when idle or steers an active turn immediately. Reply to a relayed Codex message to target its original conversation and include the quoted text. A 👀 reaction marks the exact message Codex accepted. After Codex accepts a message or transcript, Telegram shows the bot typing while the turn runs and pauses the indicator when action is needed. A race is reported without silently starting or queueing another turn. Observed activity never changes your selected message target.
 
 Watched conversations relay completed user-facing progress, plans, final replies and failures, even when work starts in ChatGPT. Messages include the thread label; raw tool output is excluded. Newly watched threads do not dump old history. Reconnection uses the stored history cursor to recover missed replies.
 
@@ -64,9 +64,9 @@ Voice notes are off by default. To enable them:
 2. In **@BotFather**, send `/setinline`, select the bridge bot, and set a placeholder such as `Send a transcript`. The bridge checks that inline mode is enabled when voice support starts.
 3. In the bridge's local `.env`, set `CODEX_TELEGRAM_WHISPER_MODEL` to the absolute model path. If the executables are outside the service's `PATH`, set `CODEX_TELEGRAM_WHISPER_CLI` and `CODEX_TELEGRAM_FFMPEG` to their absolute paths. Restart the bridge service to load the settings.
 
-Select a conversation and send a voice note in the bot's private chat. The bridge runs transcription locally and replies with a preview and the destination conversation. Tap **Send transcript**, then select the result in Telegram's picker. Telegram posts it under your name with a “via bot” label. That post starts or steers a turn in the conversation selected when you sent the note. The preview alone leaves Codex untouched.
+Select a conversation and send a voice note in the bot's private chat. The bridge runs transcription locally and replies with a preview and the destination conversation. To make a small correction, select the wrong words in the preview, choose **Quote**, and reply with the replacement. To replace the full draft, reply with the revised text. Review the updated preview and tap **Send transcript**, then select the result in Telegram's picker. Telegram posts it under your name with a “via bot” label. That post starts or steers a turn in the conversation selected when you sent the note. The preview alone leaves Codex untouched.
 
-Notes are limited to two minutes and 10 MiB. Transcription has a two-minute deadline, and drafts expire after 30 minutes. Audio is processed in a private temporary directory and removed after processing. A Telegram personal login and a transcription API key are unnecessary. To disable voice handling, remove `CODEX_TELEGRAM_WHISPER_MODEL` and restart the bridge service.
+Notes are limited to two minutes and 10 MiB. Whisper has a three-minute transcription deadline, and drafts expire after 30 minutes. Audio is processed in a private temporary directory and removed after processing. A Telegram personal login and a transcription API key are unnecessary. To disable voice handling, remove `CODEX_TELEGRAM_WHISPER_MODEL` and restart the bridge service.
 
 ## Approvals and questions
 
