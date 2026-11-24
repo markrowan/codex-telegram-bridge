@@ -29,6 +29,15 @@ function messageText(item: any): string | undefined {
   if (item?.type !== 'agentMessage' && item?.type !== 'plan') return;
   return typeof item.text === 'string' && item.text.trim() ? item.text : undefined;
 }
+function telegramDeclaration(text: string): { kind?: 'internal' | 'attention'; body: string } {
+  const header = /^\[\[telegram:(internal|attention)\]\](?:\r?\n|$)/.exec(text);
+  if (!header) return { body: text };
+  const body = text.slice(header[0].length);
+  // Ambiguous or empty declarations fail open, including another declaration
+  // quoted in the body. Only one exact, unquoted first line controls delivery.
+  if (!body.trim() || body.includes('[[telegram:')) return { body: text };
+  return { kind: header[1] as 'internal' | 'attention', body };
+}
 export class Controller {
   private routes = new Map<string, Route>();
   private prompts = new Map<string, Prompt>();
@@ -129,10 +138,10 @@ export class Controller {
   private async mutate(updateId: number, method: string, params: Record<string, any>): Promise<any> {
     const draft = this.store.data.updates[String(updateId)]?.voice;
     if (draft) delete draft.text;
-    this.store.update(updateId, { state: 'dispatching', operation: method, threadId: params.threadId });
+    this.store.update(updateId, { state: 'dispatching', operation: method, threadId: params.threadId, turnId: params.expectedTurnId ?? params.turnId });
     try {
       const result = await this.codex.request(method, params);
-      this.store.update(updateId, { state: 'accepted', threadId: result.thread?.id ?? params.threadId, turnId: result.turn?.id ?? result.turnId });
+      this.store.update(updateId, { state: 'accepted', threadId: result.thread?.id ?? params.threadId, turnId: params.expectedTurnId ?? result.turn?.id ?? result.turnId });
       return result;
     } catch (error) {
       this.store.update(updateId, { state: error instanceof RpcError ? 'rejected' : 'uncertain', error: (error as Error).message });
@@ -411,12 +420,12 @@ export class Controller {
       return;
     }
     if (text === '/start' || text === '/help') {
-      await this.send(key, 'Choose /threads, then send text. While Codex works, text steers its active turn.\n/threads — choose an existing thread\n/watch — watch the selected thread\n/unwatch — stop its notifications\n/new — choose a project for a new thread\n/status — connection, selection and delivery state\n/stop — interrupt the selected active turn\n/help — these commands\nReply to a question card to enter a free-text answer. Approvals apply only to the displayed action.'); return;
+      await this.send(key, 'Choose /threads, then send text. While Codex works, text steers its active turn.\n/threads — choose an existing thread\n/watch — watch the selected thread\n/unwatch — stop its notifications\n/notifications [important|all] — view or change the selected thread’s Telegram notifications\n/new — choose a project for a new thread\n/status — connection, selection and delivery state\n/stop — interrupt the selected active turn\n/help — these commands\nReply to a question card to enter a free-text answer. Approvals apply only to the displayed action.'); return;
     }
     if (text === '/status') {
       const uncertain = Object.values(this.store.data.updates).filter(r => r.state === 'uncertain').length;
       const deliveries = Object.values(this.store.data.deliveries).filter(r => r.state === 'uncertain').length;
-      await this.send(key, `Codex: ${this.codex.connected && !this.reconnecting ? 'connected' : 'reconnecting'}\nSelected: ${this.store.data.selected ? this.label(this.store.data.selected) : 'none'}\nWatched: ${this.store.data.watched.length}\nUncertain dispatches: ${uncertain}; uncertain Telegram deliveries: ${deliveries}. These are not automatically repeated.\n${this.store.data.watched.map(id => `${this.label(id)}${this.store.data.threads[id]?.lastError ? ': ' + this.store.data.threads[id].lastError : ''}`).join('\n')}`); return;
+      await this.send(key, `Codex: ${this.codex.connected && !this.reconnecting ? 'connected' : 'reconnecting'}\nSelected: ${this.store.data.selected ? this.label(this.store.data.selected) : 'none'}\nNotifications: ${this.store.data.selected ? this.notificationMode(this.store.data.selected) : 'none'}\nWatched: ${this.store.data.watched.length}\nUncertain dispatches: ${uncertain}; uncertain Telegram deliveries: ${deliveries}. These are not automatically repeated.\n${this.store.data.watched.map(id => `${this.label(id)} · notifications: ${this.notificationMode(id)}${this.store.data.threads[id]?.lastError ? ': ' + this.store.data.threads[id].lastError : ''}`).join('\n')}`); return;
     }
     if (text === '/threads') { await this.threadPicker(key); return; }
     if (text === '/new') {
@@ -428,6 +437,14 @@ export class Controller {
     }
     const selected = this.store.data.selected;
     if (!selected) { await this.send(key, 'Choose a conversation with /threads or create one with /new first.'); return; }
+    if (text === '/notifications' || text.startsWith('/notifications ')) {
+      const mode = text.slice('/notifications'.length).trim();
+      if (mode && mode !== 'important' && mode !== 'all') {
+        await this.send(key, 'Use /notifications to view the selected thread’s mode, or /notifications important|all to change it.'); return;
+      }
+      if (mode) { this.store.data.threads[selected].notificationMode = mode; this.store.save(); }
+      await this.send(key, `${this.label(selected)} Notifications: ${this.notificationMode(selected)}.${this.notificationMode(selected) === 'important' ? ' Routine messages explicitly marked internal stay in Codex; attention and unmarked messages still reach Telegram.' : ' All new replies reach Telegram.'} Previously handled messages are not replayed.`); return;
+    }
     if (text === '/unwatch') {
       this.store.data.watched = this.store.data.watched.filter(id => id !== selected); this.store.save();
       this.typingTurns.delete(selected);
@@ -591,12 +608,39 @@ export class Controller {
     await this.reconcile(id);
   }
   private itemKey(threadId: string, itemId: string, text: string): string { return `item:${threadId}:${itemId}:${fingerprint(text)}`; }
-  private async relayItem(threadId: string, item: any): Promise<void> {
+  private notificationMode(threadId: string): 'all' | 'important' {
+    return this.store.data.threads[threadId]?.notificationMode === 'important' ? 'important' : 'all';
+  }
+  private telegramReply(threadId: string, turnId?: string): boolean {
+    return Object.values(this.store.data.updates).some(dispatch =>
+      dispatch.threadId === threadId && ['turn/start', 'turn/steer'].includes(dispatch.operation ?? '')
+      && ['dispatching', 'accepted', 'uncertain'].includes(dispatch.state)
+      && (!turnId || dispatch.turnId === turnId
+        // A response may arrive before the start RPC result. An unresolved send
+        // without a turn ID remains ambiguous after restart: preserve replies.
+        || (!dispatch.turnId && ['dispatching', 'uncertain'].includes(dispatch.state))));
+  }
+  private async relayItem(threadId: string, item: any, turnId?: string): Promise<void> {
     const text = messageText(item);
     if (!text || !item.id) return;
     const key = this.itemKey(threadId, item.id, text);
-    if (this.store.data.deliveries[key]?.state === 'sent') return;
-    const ids = await this.send(key, `${this.label(threadId)}\n${text}`, undefined, undefined, true);
+    let delivery = this.store.data.deliveries[key];
+    if (delivery?.state === 'sent' || delivery?.state === 'suppressed') return;
+    const declaration = telegramDeclaration(text);
+    if (!delivery) {
+      // Existing chunks predate this decision. Preserve their original rendering,
+      // attempts and uncertainty; changing mode never reclassifies an old send.
+      const existingChunks = Object.keys(this.store.data.deliveries).some(candidate => candidate.startsWith(key + ':'));
+      if (!existingChunks && this.notificationMode(threadId) === 'important'
+        && declaration.kind === 'internal' && !this.telegramReply(threadId, turnId)) {
+        this.store.data.deliveries[key] = { text: '', state: 'suppressed', policyReason: 'telegram_internal' };
+        this.store.save(); return;
+      }
+      delivery = { text: '', state: 'forwarding', stripNotificationHeader: !existingChunks && !!declaration.kind };
+      this.store.data.deliveries[key] = delivery; this.store.save();
+    }
+    const body = delivery.stripNotificationHeader ? declaration.body : text;
+    const ids = await this.send(key, `${this.label(threadId)}\n${body}`, undefined, undefined, true);
     if (ids.length) { this.store.data.deliveries[key] = { text: '', state: 'sent' }; this.store.save(); }
   }
   private async relayOutcome(threadId: string, turn: any): Promise<void> {
@@ -645,7 +689,7 @@ export class Controller {
       for (const turn of result.data ?? []) {
         state.activeTurn = turn.status === 'inProgress' ? turn.id : undefined;
         if (turn.status !== 'inProgress') {
-          for (const item of turn.items ?? []) await this.relayItem(threadId, item);
+          for (const item of turn.items ?? []) await this.relayItem(threadId, item, turn.id);
           await this.relayOutcome(threadId, turn);
         }
       }
@@ -680,7 +724,7 @@ export class Controller {
       if (this.fileItems.size >= 500) this.fileItems.delete(this.fileItems.keys().next().value!);
       this.fileItems.set(`${p.threadId}:${p.item.id}`, p.item);
     }
-    if (message.method === 'item/completed') await this.relayItem(p.threadId, p.item);
+    if (message.method === 'item/completed') await this.relayItem(p.threadId, p.item, p.turnId);
     if (message.method === 'turn/started') {
       this.store.data.threads[p.threadId].activeTurn = p.turn?.id; this.store.save();
       const typingTurn = this.typingTurns.get(p.threadId);

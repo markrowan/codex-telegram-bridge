@@ -45,6 +45,7 @@ codex-tg service enable
 | --- | --- |
 | `/threads` | Pick a loaded or recent conversation, with pagination. Selection also watches it. |
 | `/watch` / `/unwatch` | Enable or stop notifications for the selected conversation. |
+| `/notifications [all\|important]` | Show or change the selected conversation’s Telegram delivery mode. |
 | `/new` | Pick a configured project and create a conversation. Repository instructions still apply. |
 | `/stop` | Interrupt the selected active turn. |
 | `/status` | Show selection, watched threads, connection and uncertain delivery counts. |
@@ -52,9 +53,35 @@ codex-tg service enable
 
 Ordinary text starts a turn when idle or steers an active turn immediately. Reply to a relayed Codex message to target its original conversation and include the quoted text. A 👀 reaction marks the exact message Codex accepted. After Codex accepts a message or transcript, Telegram shows the bot typing while the turn runs and pauses the indicator when action is needed. A race is reported without silently starting or queueing another turn. Observed activity never changes your selected message target.
 
-Watched conversations relay completed user-facing progress, plans, final replies and failures, even when work starts in ChatGPT. Messages include the thread label; raw tool output is excluded. Newly watched threads do not dump old history. Reconnection uses the stored history cursor to recover missed replies.
+By default, watched conversations relay completed user-facing progress, plans, final replies and failures, even when work starts in ChatGPT. Messages include the thread label; raw tool output is excluded. Newly watched threads do not dump old history. Reconnection uses the stored history cursor to recover missed replies.
 
 Assistant replies render Markdown as native Telegram entities: bold, italic, strikethrough, links, inline code and fenced code blocks. Headings use bold text; lists keep their hierarchy, quotes use a visible prefix, and tables use readable text rows. Raw HTML stays literal. Formatting survives long-message splitting, including code whitespace and emoji. Approval action details remain literal so their commands and paths are displayed exactly.
+
+## Important notifications
+
+Use `/notifications important` for a selected conversation to keep routine coordination in Codex while reducing Telegram traffic. `/notifications all` restores full forwarding for future items. `/notifications` and `/status` show the current mode. Other watched conversations retain their own settings, and the complete Codex transcript is unchanged.
+
+The coordinating assistant can designate a completed message by putting exactly one of these declarations on its first line:
+
+```text
+[[telegram:internal]]
+Routine coordination detail retained in Codex.
+```
+
+```text
+[[telegram:attention]]
+A concrete decision, material change, or verified outcome for the operator.
+```
+
+In important mode, an exact internal declaration suppresses that item in Telegram, including a routine progress message, plan or final reply. An attention declaration is delivered. Recognized declarations are removed from forwarded Telegram text. Missing, malformed or unrecognized declarations remain deliverable: uncertainty must not silently hide a potentially important answer. A quoted example or fenced code block is not a routing declaration.
+
+This is a bridge delivery contract, not a native silent-response feature. The assistant must still produce whatever responses its Codex interface requires. It should designate ordinary staging coordination, expected waits, local corrections and unchanged status as internal. Decisions outside existing authority, material risk, meaningful verified outcomes, changes requiring steering and recurring missed checkpoints warrant attention. Direct operator questions should receive a normal answer.
+
+Authenticated Telegram replies remain protected against an accidental internal designation. Actual platform approval and question cards, failed/interrupted turn notices and delivery failures use their existing paths. An attention declaration never grants permission for an operational action.
+
+Live delivery and history recovery apply the same policy. Intentionally suppressed items stay suppressed across reconnects and mode changes; previously attempted or uncertain deliveries retain their original disposition. Changing the mode does not reset the journal, replay old history or change the selected conversation.
+
+To undo the notification preference, use `/notifications all` on the current release. Older bridge releases do not understand the new routing dispositions; do not use a blind binary downgrade or reset the journal to undo this setting. Preserve the current journal and review compatibility before a software downgrade.
 
 ## Voice notes
 
