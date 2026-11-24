@@ -4,10 +4,10 @@ import type { VoiceFailure } from './voice.js';
 
 export type VoiceDraft = { id: string; messageId: number; expiresAt: number; text?: string; revision?: number; confirmationId?: number };
 export type Dispatch = { state: 'received' | 'voice' | 'dispatching' | 'accepted' | 'done' | 'uncertain' | 'rejected'; update: any; threadId?: string; turnId?: string; operation?: string; error?: string; voice?: VoiceDraft; voiceFailure?: VoiceFailure };
-export type Delivery = { text: string; state: 'queued' | 'sending' | 'sent' | 'uncertain' | 'cancelled'; messageId?: number; extra?: any };
+export type Delivery = { text: string; state: 'queued' | 'sending' | 'sent' | 'uncertain' | 'cancelled' | 'forwarding' | 'suppressed'; messageId?: number; extra?: any; policyReason?: 'telegram_internal'; stripNotificationHeader?: boolean };
 export type RuntimeState = {
   version: 1; selected?: string; watched: string[]; owner?: { userId: string; chatId: string };
-  threads: Record<string, { name: string; cwd?: string; activeTurn?: string; cursor?: string; baseline?: boolean; lastError?: string }>;
+  threads: Record<string, { name: string; cwd?: string; activeTurn?: string; cursor?: string; baseline?: boolean; lastError?: string; notificationMode?: 'all' | 'important' }>;
   updates: Record<string, Dispatch>; deliveries: Record<string, Delivery>; offset: number;
 };
 

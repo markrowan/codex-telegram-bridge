@@ -864,3 +864,287 @@ test('a selected quote edits only that occurrence and never submits by itself', 
   await controller.process(f.posted(4, { text: 'Monday morning. Tuesday afternoon.' }));
   assert.equal(f.outcomes().length, 1);
 });
+
+
+function notificationFixture() {
+  const f = fixture();
+  f.store.data.threads.alpha.notificationMode = 'important';
+  f.store.save();
+  return f;
+}
+function relayEvent(item, turnId = 'owner-turn', threadId = 'alpha') {
+  return { method: 'item/completed', params: { threadId, turnId, item } };
+}
+function replayItems(f, items, turnId = 'owner-turn') {
+  const original = f.codex.request.bind(f.codex);
+  f.codex.request = async (method, params) => {
+    if (method !== 'thread/turns/list') return original(method, params);
+    f.calls.push({ method, params });
+    return { backwardsCursor: 'notification-checkpoint', data: [{ id: turnId, status: 'completed', items }] };
+  };
+}
+function itemDelivery(store, id) {
+  return Object.entries(store.data.deliveries).find(([key]) => key.startsWith('item:alpha:' + id + ':') && key.split(':').length === 4)?.[1];
+}
+
+test('notification mode commands are authenticated, persistent and local to the selected thread', async () => {
+  const f = fixture();
+  f.store.data.threads.alpha.cursor = 'keep-cursor';
+  f.store.data.threads.beta = { name: 'Beta', baseline: true };
+  f.store.data.watched.push('beta');
+  await f.controller.process(f.message(1, '/notifications'));
+  assert.match(f.sent.at(-1).text, /Notifications: all/);
+  await f.controller.process(f.message(2, '/notifications important', { from: { id: 2 } }));
+  assert.equal(f.store.data.threads.alpha.notificationMode, undefined);
+  await f.controller.process(f.message(3, '/notifications important'));
+  assert.equal(f.store.data.threads.alpha.notificationMode, 'important');
+  assert.equal(f.store.data.threads.beta.notificationMode, undefined);
+  assert.equal(f.store.data.threads.alpha.cursor, 'keep-cursor');
+  await f.controller.process(f.message(4, '/notifications silent'));
+  assert.equal(f.store.data.threads.alpha.notificationMode, 'important');
+  await f.controller.process(f.message(5, '/status'));
+  assert.match(f.sent.at(-1).text, /Notifications: important/);
+  assert.match(f.sent.at(-1).text, /Beta.*notifications: all/);
+  const store = new Store(f.file);
+  const restarted = new Controller(store, f.codex, f.telegram, []);
+  await restarted.process(f.message(6, '/notifications'));
+  assert.match(f.sent.at(-1).text, /Notifications: important/);
+  await restarted.process(f.message(7, '/notifications all'));
+  assert.equal(store.data.threads.alpha.notificationMode, 'all');
+  assert.equal(store.data.threads.alpha.cursor, 'keep-cursor');
+  assert.equal(f.calls.length, 0);
+});
+
+test('exact internal declarations suppress every message phase and plans through live, history and restart', async () => {
+  const variants = [
+    { type: 'agentMessage', phase: 'commentary' },
+    { type: 'agentMessage', phase: 'partial_answer' },
+    { type: 'agentMessage', phase: 'final_answer' },
+    { type: 'agentMessage' },
+    { type: 'plan' },
+  ];
+  for (const [index, variant] of variants.entries()) {
+    const f = notificationFixture();
+    const item = { ...variant, id: 'internal-' + index, text: '[[telegram:internal]]\nOwner coordination remains in Codex.' };
+    const historyFirst = notificationFixture();
+    replayItems(historyFirst, [item]);
+    await historyFirst.controller.reconcile('alpha');
+    assert.equal(historyFirst.sent.length, 0);
+    assert.equal(itemDelivery(historyFirst.store, item.id).state, 'suppressed');
+    await f.controller.notification(relayEvent(item));
+    replayItems(f, [item]);
+    await f.controller.reconcile('alpha');
+    assert.equal(f.sent.length, 0);
+    assert.deepEqual(itemDelivery(f.store, item.id), { text: '', state: 'suppressed', policyReason: 'telegram_internal' });
+    assert.equal(f.store.data.threads.alpha.cursor, 'notification-checkpoint');
+    const store = new Store(f.file);
+    store.data.threads.alpha.notificationMode = 'all'; store.save();
+    const restarted = new Controller(store, f.codex, f.telegram, []);
+    await restarted.reconnect();
+    await restarted.notification(relayEvent(item));
+    assert.equal(f.sent.length, 0);
+    assert.equal(itemDelivery(store, item.id).state, 'suppressed');
+    assert.equal(store.data.threads.alpha.cursor, 'notification-checkpoint');
+    assert.match(item.text, /^\[\[telegram:internal\]\]/);
+  }
+});
+
+test('attention and unclassified Codex replies deliver once without changing the original item', async () => {
+  const f = notificationFixture();
+  const items = [
+    { type: 'agentMessage', phase: 'commentary', id: 'attention', text: '[[telegram:attention]]\r\nA decision is needed.' },
+    { type: 'agentMessage', phase: 'final_answer', id: 'direct-codex', text: 'Here is the answer to your question in Codex.' },
+    { type: 'agentMessage', phase: 'commentary', id: 'codex-progress', text: 'Unclassified progress is still delivered.' },
+    { type: 'plan', id: 'attention-plan', text: '[[telegram:attention]]\nPlease review this plan.' },
+  ];
+  for (const item of items) await f.controller.notification(relayEvent(item));
+  replayItems(f, items);
+  const store = new Store(f.file);
+  const restarted = new Controller(store, f.codex, f.telegram, []);
+  await restarted.reconcile('alpha');
+  for (const item of items) await restarted.notification(relayEvent(item));
+  assert.equal(f.sent.length, items.length);
+  assert.ok(f.sent.every(message => !message.text.includes('[[telegram:')));
+  assert.ok(items[0].text.startsWith('[[telegram:attention]]'));
+  assert.ok(items.every(item => itemDelivery(store, item.id).state === 'sent'));
+});
+
+test('unmarked, quoted, fenced, malformed and conflicting declarations fail open', async () => {
+  const bodies = [
+    'Internal coordination without a declaration.',
+    '> [[telegram:internal]]\nA quoted example.',
+    '\`\`\`text\n[[telegram:internal]]\n\`\`\`',
+    '    [[telegram:internal]]\nIndented code.',
+    '\`[[telegram:internal]]\`\nInline code.',
+    ' [[telegram:internal]]\nLeading whitespace.',
+    '\n[[telegram:internal]]\nNot the first line.',
+    '[[telegram:internal]] \nTrailing whitespace.',
+    '[[telegram:INTERNAL]]\nWrong case.',
+    '[[telegram:internal]] extra\nNot standalone.',
+    '[[telegram:internal]\nMalformed brackets.',
+    '[[telegram:internal]]\n[[telegram:attention]]\nConflicting declarations.',
+    '[[telegram:attention]]\n[[telegram:internal]]\nConflicting declarations.',
+    '[[telegram:internal]]\n[[telegram:internal]]\nDuplicate declaration.',
+    '[[telegram:internal]]\nAn example: [[telegram:attention]]',
+    '[[telegram:internal]]',
+  ];
+  const f = notificationFixture();
+  for (const [index, text] of bodies.entries()) {
+    const item = { type: 'agentMessage', id: 'fail-open-' + index, text };
+    await f.controller.notification(relayEvent(item));
+    assert.equal(itemDelivery(f.store, item.id).state, 'sent', text);
+  }
+  assert.equal(f.sent.length, bodies.length);
+});
+
+test('default all mode and other watched threads retain their replies', async () => {
+  const f = notificationFixture();
+  f.store.data.threads.beta = { name: 'Beta', baseline: true };
+  f.store.data.watched.push('beta'); f.store.save();
+  await f.controller.notification(relayEvent({ type: 'agentMessage', id: 'other', text: '[[telegram:internal]]\nBeta still reports everything.' }, 'beta-turn', 'beta'));
+  assert.equal(f.sent.length, 1);
+  assert.match(f.sent[0].text, /Beta still reports everything/);
+  assert.ok(!f.sent[0].text.includes('[[telegram:internal]]'));
+  assert.equal(f.store.data.threads.beta.notificationMode, undefined);
+});
+
+test('known Telegram replies override an internal declaration in both live delivery and history', async () => {
+  for (const history of [false, true]) {
+    const f = notificationFixture();
+    await f.controller.process(f.message(1, 'Please answer this'));
+    const item = { type: 'agentMessage', id: 'direct-telegram', text: '[[telegram:internal]]\nYour direct answer.' };
+    replayItems(f, [item], 'started');
+    if (history) {
+      const restarted = new Controller(new Store(f.file), f.codex, f.telegram, []);
+      await restarted.reconcile('alpha'); await restarted.reconcile('alpha');
+    } else {
+      await f.controller.notification(relayEvent(item, 'started'));
+      await f.controller.reconcile('alpha');
+    }
+    assert.equal(f.sent.length, 1);
+    assert.match(f.sent[0].text, /Your direct answer/);
+    assert.ok(!f.sent[0].text.includes('[[telegram:'));
+  }
+});
+
+test('a human steer preserves the known active turn even when the RPC response lacks its id', async () => {
+  const f = notificationFixture(); f.codex.active = 'running';
+  const original = f.codex.request.bind(f.codex);
+  f.codex.request = async (method, params) => method === 'turn/steer' ? {} : original(method, params);
+  await f.controller.process(f.message(1, 'Answer me in this turn'));
+  assert.equal(f.store.data.updates['1'].turnId, 'running');
+  await f.controller.notification(relayEvent({ type: 'agentMessage', id: 'steer-answer', text: '[[telegram:internal]]\nAnswer to the steer.' }, 'running'));
+  await f.controller.notification(relayEvent({ type: 'agentMessage', id: 'other-turn', text: '[[telegram:internal]]\nUnrelated internal result.' }, 'elsewhere'));
+  assert.equal(f.sent.length, 1);
+  assert.match(f.sent[0].text, /Answer to the steer/);
+  assert.equal(itemDelivery(f.store, 'other-turn').state, 'suppressed');
+});
+
+
+test('a reply arriving before the input RPC result is preserved and remains deduplicated', async () => {
+  const f = notificationFixture(); const original = f.codex.request.bind(f.codex);
+  const item = { type: 'agentMessage', id: 'early-answer', text: '[[telegram:internal]]\nAn immediate answer.' };
+  f.codex.request = async (method, params) => {
+    if (method === 'turn/start') {
+      assert.equal(f.store.data.updates['1'].state, 'dispatching');
+      await f.controller.notification(relayEvent(item, 'started'));
+    }
+    return original(method, params);
+  };
+  await f.controller.process(f.message(1, 'Answer immediately'));
+  await f.controller.notification(relayEvent(item, 'started'));
+  assert.equal(f.sent.length, 1);
+  assert.equal(itemDelivery(f.store, item.id).state, 'sent');
+  assert.equal(f.store.data.updates['1'].turnId, 'started');
+});
+
+test('an unresolved Telegram input without a turn id fails open after restart; a rejected input does not', async () => {
+  for (const rejected of [false, true]) {
+    const f = notificationFixture(); const original = f.codex.request.bind(f.codex);
+    f.codex.request = async (method, params) => {
+      if (method === 'turn/start') throw rejected ? new RpcError('Rejected', -32600) : new Error('Lost acceptance response');
+      return original(method, params);
+    };
+    await f.controller.process(f.message(1, 'Answer me'));
+    assert.equal(f.sent.length, 1); // The existing channel error bypasses filtering.
+    assert.match(f.sent[0].text, /Request was not retried/);
+    const store = new Store(f.file);
+    const restarted = new Controller(store, f.codex, f.telegram, []);
+    await restarted.notification(relayEvent({ type: 'agentMessage', id: 'after-uncertain', text: '[[telegram:internal]]\nA possible direct answer.' }, 'unproved-turn'));
+    assert.equal(f.sent.length, rejected ? 1 : 2);
+    assert.equal(store.data.updates['1'].state, rejected ? 'rejected' : 'uncertain');
+  }
+});
+
+test('uncertain output keeps its original decision and chunks after mode changes and restart', async () => {
+  const f = fixture(); let attempts = 0;
+  f.telegram.send = async () => { attempts++; throw new Error('Lost after acceptance'); };
+  const item = { type: 'agentMessage', id: 'uncertain-internal', text: '[[telegram:internal]]\nAttempted before important mode.' };
+  await assert.rejects(f.controller.notification(relayEvent(item)), /uncertain/);
+  const before = structuredClone(f.store.data.deliveries);
+  f.store.data.threads.alpha.notificationMode = 'important'; f.store.save();
+  const store = new Store(f.file);
+  const restarted = new Controller(store, f.codex, f.telegram, []);
+  await restarted.notification(relayEvent(item));
+  await restarted.flush();
+  assert.equal(attempts, 1);
+  assert.deepEqual(store.data.deliveries, before);
+  assert.equal(itemDelivery(store, item.id).state, 'forwarding');
+  assert.equal(Object.values(store.data.deliveries).filter(d => d.state === 'uncertain').length, 1);
+});
+
+test('partially delivered items retain chunk identities and uncertainty when the mode changes', async () => {
+  const f = fixture(); const send = f.telegram.send; let attempts = 0;
+  f.telegram.send = async (...args) => {
+    attempts++;
+    if (attempts === 2) throw new Error('Lost second chunk');
+    return send(...args);
+  };
+  const item = { type: 'agentMessage', id: 'partial-internal', text: '[[telegram:internal]]\n' + 'x'.repeat(10000) };
+  await assert.rejects(f.controller.notification(relayEvent(item)), /uncertain/);
+  const uncertain = Object.entries(f.store.data.deliveries).find(([, d]) => d.state === 'uncertain');
+  const snapshot = structuredClone(uncertain[1]);
+  f.store.data.threads.alpha.notificationMode = 'important'; f.store.save();
+  await f.controller.notification(relayEvent(item));
+  assert.equal(attempts, 3);
+  assert.equal(f.sent.length, 2);
+  assert.deepEqual(f.store.data.deliveries[uncertain[0]], snapshot);
+  assert.equal(itemDelivery(f.store, item.id).state, 'forwarding');
+  assert.ok(f.sent.every(message => !message.text.includes('[[telegram:')));
+});
+
+test('existing legacy chunks are never converted into a suppressed item or rerendered', async () => {
+  const f = fixture(); const item = { type: 'agentMessage', id: 'legacy-internal', text: '[[telegram:internal]]\nLegacy text.' };
+  f.telegram.send = async () => { throw new Error('Lost before upgrade'); };
+  await assert.rejects(f.controller.notification(relayEvent(item)));
+  const parent = Object.keys(f.store.data.deliveries).find(key => key.startsWith('item:') && key.split(':').length === 4);
+  delete f.store.data.deliveries[parent];
+  const child = Object.values(f.store.data.deliveries).find(d => d.state === 'uncertain');
+  child.text = '[Alpha · alpha]\n' + item.text; // Original release did not strip headers.
+  const before = structuredClone(child);
+  f.store.data.threads.alpha.notificationMode = 'important'; f.store.save();
+  let attempts = 0; f.telegram.send = async () => { attempts++; return { message_id: 1 }; };
+  await f.controller.notification(relayEvent(item));
+  assert.equal(attempts, 0);
+  assert.deepEqual(child, before);
+  assert.equal(itemDelivery(f.store, item.id).state, 'forwarding');
+  assert.equal(itemDelivery(f.store, item.id).stripNotificationHeader, false);
+});
+
+test('important mode preserves real approval, question, failure and interruption routes', async () => {
+  const f = notificationFixture();
+  await f.controller.serverRequest(command());
+  await f.controller.process(f.callback(1, f.sent.at(-1).extra.reply_markup.inline_keyboard[0][0].callback_data));
+  assert.deepEqual(f.responses.at(-1).result, { decision: 'accept' });
+  await f.controller.serverRequest({ id: 99, method: 'item/tool/requestUserInput', params: {
+    threadId: 'alpha', turnId: 'turn', questions: [{ id: 'decision', question: 'Choose?', options: [{ label: 'Yes' }] }],
+  } });
+  await f.controller.process(f.callback(2, f.sent.at(-1).extra.reply_markup.inline_keyboard[0][0].callback_data));
+  assert.deepEqual(f.responses.at(-1).result, { answers: { decision: { answers: ['Yes'] } } });
+  for (const status of ['failed', 'interrupted']) {
+    const event = { method: 'turn/completed', params: { threadId: 'alpha', turn: { id: status, status, error: { message: 'Visible outcome' } } } };
+    await f.controller.notification(event); await f.controller.notification(event);
+    assert.equal(f.sent.filter(message => message.text.includes('Turn ' + status)).length, 1);
+  }
+  assert.equal(f.sent.length, 4);
+});

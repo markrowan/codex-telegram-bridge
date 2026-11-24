@@ -54,3 +54,19 @@ Use the existing controller/connect loop; no added service or daemon lifecycle c
 ### Subscription retry follow-up
 
 - [x] A final-head review found that transient thread/resume failures were recorded but not retried. Extend the existing retry entry to retain subscription work, retry watch with inherited settings, and test a healthy-socket restoration before merge. No separate retry service or new configuration.
+
+
+## Telegram attention mode
+
+The operator accepted Telegram as the selective attention channel while Codex retains the complete working transcript. Reuse the current bridge controller, private journal and user service. The authoritative baseline for this follow-up is deployed/main `bad7e2dd5ab2b3fa505a56291be0087e3df22a82`.
+
+- [x] Add an opt-in per-thread important mode with an exact leading routine/attention declaration; leave unknown output deliverable and retain the default full mode.
+- [x] Apply one disposition to live and recovered items; preserve direct Telegram answers, approvals/questions, failures, cursor identity and uncertain effects.
+- [x] Verify focused regression cases and the existing suite: type check passed; 93 tests passed, with the final controller assertions rechecked.
+- [ ] Independently review the exact source and publish through the existing PR/CI path.
+- [ ] Install the qualified immutable bridge release, preserve the existing journal/pairing/configuration/autostart and enable the mode only for the intended conversation.
+- [ ] Record the deployed-process/readback evidence and distinguish fixture verification from a naturally observed filtered coordination event.
+
+A routine designation is an explicit application protocol, not a native silent-turn feature or proof of message origin. The model still responds in Codex. The bridge makes the delivery decision. Approval-authority judgment remains with the coordinating agent; actual platform requests must stay reachable.
+
+Scope is the bridge and its existing per-thread delivery policy. No new dependency, service, classifier model, coordinator, periodic digest or state database. Do not restart or reconfigure Codex, alter engineering-owner routing or touch production/science operations. Keep private recipient identities and deployment evidence outside the public repository. Retain a rollback route without discarding or resetting delivery state.
